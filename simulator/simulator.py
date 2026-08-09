@@ -185,10 +185,11 @@ def setup_socket_context(socket_id):
     """Sets up a socket context (Unit 1 or 2)."""
     block = ModbusSequentialDataBlock(0, [0]*2000)
     
-    # === Meter Measurements (Registers 300-424) ===
-    # HA reads registers 300-424 (125 registers) and uses offsets from 300
+    # === Meter Measurements (Registers 300-425) ===
+    # 126 registers: one past the 125-register FC03 ceiling, so a client has to
+    # read them in two requests.
     block.setValues(reg(300), encode_uint16(3))      # Meter State (offset 0)
-    block.setValues(reg(301), encode_uint32(1500))   # Meter Age ms (offset 1, 4 regs but read as UINT16)
+    block.setValues(reg(301), encode_uint64(1500))   # Meter last value timestamp, ms (301-304)
     block.setValues(reg(305), encode_uint16(1))      # Meter Type (offset 5)
     
     # Voltages L-N (float32, V) - offset 6, 8, 10
@@ -247,17 +248,17 @@ def setup_socket_context(socket_id):
     block.setValues(reg(386), encode_double(0.0))
     block.setValues(reg(390), encode_double(0.0))
     
-    # Apparent Energy (float64, VAh) - offset 92, 96, 100, 104
-    block.setValues(reg(392), encode_double(15542.0))
-    block.setValues(reg(396), encode_double(15485.0))
-    block.setValues(reg(400), encode_double(15612.0))
-    block.setValues(reg(404), encode_double(46639.0))
+    # Apparent Energy (float64, VAh) - offset 94, 98, 102, 106
+    block.setValues(reg(394), encode_double(15542.0))
+    block.setValues(reg(398), encode_double(15485.0))
+    block.setValues(reg(402), encode_double(15612.0))
+    block.setValues(reg(406), encode_double(46639.0))
     
-    # Reactive Energy (float64, VArh) - offset 108, 112, 116, 120
-    block.setValues(reg(408), encode_double(3024.0))
-    block.setValues(reg(412), encode_double(3189.0))
-    block.setValues(reg(416), encode_double(2956.0))
-    block.setValues(reg(420), encode_double(9169.0))  # Reactive Energy Sum
+    # Reactive Energy (float64, VArh) - offset 110, 114, 118, 122
+    block.setValues(reg(410), encode_double(3024.0))
+    block.setValues(reg(414), encode_double(3189.0))
+    block.setValues(reg(418), encode_double(2956.0))
+    block.setValues(reg(422), encode_double(9169.0))  # Reactive Energy Sum (422-425)
     
     # === Socket Status/Control (Registers 1200-1215) ===
     # HA reads registers 1200-1215 (16 registers)

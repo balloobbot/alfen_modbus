@@ -185,14 +185,16 @@ async def test_station_data(client, unit, result):
 
 async def test_socket_energy_data(client, socket_id, result):
     """
-    Tests read_modbus_data_socket() - Registers 300-424 (125 registers)
+    Tests the socket meter block. Registers 300-425 are 126 wide, one past the
+    125-register FC03 ceiling; this smoke test only decodes up to offset 77, so
+    it reads the first 122 and leaves the trailing FLOAT64 alone.
     
     This is called from: read_modbus_data_socket() in __init__.py
     Socket 1 uses unit=1, Socket 2 uses unit=2
     """
-    log.info("\n=== Test: Socket %d Energy Data (Unit %d, Registers 300-424) ===" % (socket_id, socket_id))
+    log.info("\n=== Test: Socket %d Energy Data (Unit %d, Registers 300-421) ===" % (socket_id, socket_id))
     
-    rr = await client.read_holding_registers(300, count=125, device_id=socket_id)
+    rr = await client.read_holding_registers(300, count=122, device_id=socket_id)
     if rr.isError():
         log.error(f"Failed to read socket {socket_id} energy data: {rr}")
         result.failed += 1
@@ -202,7 +204,7 @@ async def test_socket_energy_data(client, socket_id, result):
     
     # Decode exactly as HA component does (offsets from register 300)
     meter_state = decode_uint16(regs, 0)
-    meter_age = decode_uint16(regs, 1)  # Actually UINT16 for first part
+    meter_age = decode_uint64(regs, 1)  # Meter last value timestamp, ms (301-304)
     meter_type = decode_uint16(regs, 5)
     
     v_l1n = round(decode_float32(regs, 6), 2)
