@@ -1,116 +1,64 @@
-import logging
-from typing import Optional, Dict, Any
+"""The per-socket phase-mode selector."""
 
-from .const import (
-    DOMAIN,
-    ATTR_MANUFACTURER,
-    CONTROL_PHASE,
-    CONTROL_PHASE_MODES,
-)
+from __future__ import annotations
 
-from homeassistant.const import CONF_NAME
 from homeassistant.components.select import SelectEntity
+from homeassistant.const import CONF_NAME
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from homeassistant.core import callback
-
+from .alfen import Phases
+from .coordinator import AlfenConfigEntry, AlfenCoordinator
 from .entity import AlfenEntity
 
-_LOGGER = logging.getLogger(__name__)
+PHASE_OPTIONS = {"1 Phase": Phases.ONE, "3 Phases": Phases.THREE}
 
-async def async_setup_entry(hass, entry, async_add_entities) -> None:
-    hub_name = entry.data[CONF_NAME]
-    hub = hass.data[DOMAIN][hub_name]["hub"]
 
-    device_info = {
-        "identifiers": {(DOMAIN, hub_name)},
-        "name": hub_name,
-        "manufacturer": ATTR_MANUFACTURER,
-        "model": hub.data.get("platformType", "Unknown"),
-        "sw_version": hub.data.get("firmwareVersion", "Unknown"),
-    }
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: AlfenConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up a phase-mode select per socket."""
+    coordinator = entry.runtime_data
+    platform_name = entry.data[CONF_NAME]
+    async_add_entities(
+        AlfenPhaseSelect(coordinator, platform_name, number)
+        for number in coordinator.charger.sockets
+    )
 
-    entities = []
 
-    # If a meter is available add export control
-    for select_info in CONTROL_PHASE:
-        select = AlfenSelect(
-            hub_name,
-            hub,
-            device_info,
-            1,
-            select_info[0],
-            select_info[1],
-            select_info[2],
-            select_info[3],
-        )
-        entities.append(select)
+class AlfenPhaseSelect(AlfenEntity, SelectEntity):
+    """Whether a socket charges on one phase or three (register 1215).
 
-    # If a second socket is available, add the controls
-    if hub.has_socket_2:
-        for select_info in CONTROL_PHASE:
-            select = AlfenSelect(
-                hub_name,
-                hub,
-                device_info,
-                2,
-                select_info[0],
-                select_info[1],
-                select_info[2],
-                select_info[3],
-            )
-            entities.append(select)    
+    The station only accepts this single register written as FC16, which the
+    model handles: the field is declared ``force_fc16``.
+    """
 
-    async_add_entities(entities)
-    return True
+    _attr_options = list(PHASE_OPTIONS)
 
-def get_key(my_dict, search):
-    for k, v in my_dict.items():
-        if v == search:
-            return k
-    return None
-
-class AlfenSelect(AlfenEntity, SelectEntity):
-    """Representation of an Alfen Modbus select."""
-
-    def __init__(self,
-                 platform_name,
-                 hub,
-                 device_info,
-                 socket,
-                 name,
-                 key,
-                 register,
-                 options
+    def __init__(
+        self, coordinator: AlfenCoordinator, platform_name: str, number: int
     ) -> None:
-        """Initialize the selector."""
-        super().__init__(hub, device_info)
-        self._platform_name = platform_name
-        self._name = name+str(socket)
-        self._socket = socket
-        self._key = key+str(socket)
-        self._register = register
-        self._option_dict = options
-        self._attr_options = list(options.values())
+        """Initialize the selector for socket ``number``."""
+        super().__init__(
+            coordinator,
+            platform_name,
+            f"usephases_S{number}",
+            f"Usable phases{number}",
+        )
+        self._number = number
 
     @property
-    def name(self) -> str:
-        """Return the name."""
-        return f"{self._platform_name} {self._name}"
-
-    @property
-    def unique_id(self) -> Optional[str]:
-        return f"{self._platform_name}_{self._key}"
-
-    @property
-    def current_option(self) -> str:
-        if self._key in self._hub.data:
-            return self._hub.data[self._key]
+    def current_option(self) -> str | None:
+        """The phase mode the socket reports."""
+        phases = self.coordinator.charger.sockets[self._number].status.phases
+        return next(
+            (label for label, value in PHASE_OPTIONS.items() if value is phases), None
+        )
 
     async def async_select_option(self, option: str) -> None:
-        """Change the selected option."""
-        new_mode = get_key(self._option_dict, option)
-        payload = self._hub._client.convert_to_registers(int(new_mode), data_type=self._hub._client.DATATYPE.UINT16, word_order="big")                   
-        await self._hub.write_registers(unit=self._socket, address=self._register, payload=payload)       
-        self._hub.data[self._key] = option
-        self.hass.async_create_task(self._hub.async_refresh_modbus_data())
-        self.async_write_ha_state()
+        """Write the selected phase mode."""
+        socket = self.coordinator.charger.sockets[self._number]
+        await socket.async_set_phases(PHASE_OPTIONS[option])
+        await self.coordinator.async_request_refresh()

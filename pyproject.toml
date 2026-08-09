@@ -1,0 +1,36 @@
+[project]
+name = "alfen-modbus-hass-tests"
+version = "0"
+description = "Dev/test environment for the Alfen Modbus custom integration."
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    # The device library's only dependency; also ships the in-memory mock
+    # backend the tests run against. The tmodbus extra matches the manifest
+    # requirement, so connection.py imports the backend at top level.
+    "modbus-connection[tmodbus]>=4.3",
+    # Real Home Assistant plus its custom-component test harness.
+    "pytest-homeassistant-custom-component",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py313"
+# The simulator and its scratch scripts are standalone pymodbus dev tools.
+extend-exclude = ["simulator"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true

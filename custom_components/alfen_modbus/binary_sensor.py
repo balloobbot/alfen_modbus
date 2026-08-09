@@ -1,118 +1,101 @@
-"""Binary sensor platform for Alfen Modbus."""
-import logging
-from typing import Optional, Dict, Any
+"""Binary sensors for the Alfen Modbus integration."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from homeassistant.components.binary_sensor import (
-    BinarySensorEntity,
     BinarySensorDeviceClass,
+    BinarySensorEntity,
+    BinarySensorEntityDescription,
 )
 from homeassistant.const import CONF_NAME
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN, ATTR_MANUFACTURER
+from .alfen import AlfenSocket
+from .coordinator import AlfenConfigEntry, AlfenCoordinator
 from .entity import AlfenEntity
 
-_LOGGER = logging.getLogger(__name__)
 
-BINARY_SENSOR_TYPES = [
-    ["Car Connected", "carconnected", BinarySensorDeviceClass.PLUG, "mdi:power-plug", "mdi:power-plug-off"],
-    ["Car Charging", "carcharging", BinarySensorDeviceClass.BATTERY_CHARGING, "mdi:battery-charging", "mdi:battery-off"],
-]
+@dataclass(frozen=True, kw_only=True)
+class AlfenBinarySensorDescription(BinarySensorEntityDescription):
+    """A binary sensor derived from one socket's mode 3 state.
+
+    ``key`` is a template filled with the socket number, as in ``sensor.py``.
+    """
+
+    is_on_fn: Callable[[AlfenSocket], bool | None]
+    icon_on: str
+    icon_off: str
 
 
-async def async_setup_entry(hass, entry, async_add_entities) -> None:
-    """Set up Alfen binary sensors."""
-    hub_name = entry.data[CONF_NAME]
-    hub = hass.data[DOMAIN][hub_name]["hub"]
+BINARY_SENSORS: tuple[AlfenBinarySensorDescription, ...] = (
+    AlfenBinarySensorDescription(
+        key="socket_{n}_carconnected",
+        name="Car Connected",
+        device_class=BinarySensorDeviceClass.PLUG,
+        icon_on="mdi:power-plug",
+        icon_off="mdi:power-plug-off",
+        is_on_fn=lambda socket: socket.vehicle_connected,
+    ),
+    AlfenBinarySensorDescription(
+        key="socket_{n}_carcharging",
+        name="Car Charging",
+        device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
+        icon_on="mdi:battery-charging",
+        icon_off="mdi:battery-off",
+        is_on_fn=lambda socket: socket.charging,
+    ),
+)
 
-    device_info = {
-        "identifiers": {(DOMAIN, hub_name)},
-        "name": hub_name,
-        "manufacturer": ATTR_MANUFACTURER,
-        "model": hub.data.get("platformType", "Unknown"),
-        "sw_version": hub.data.get("firmwareVersion", "Unknown"),
-    }
 
-    entities = []
-
-    # Socket 1 binary sensors
-    for sensor_info in BINARY_SENSOR_TYPES:
-        sensor = AlfenBinarySensor(
-            hub_name,
-            hub,
-            device_info,
-            1,
-            sensor_info[0],
-            sensor_info[1],
-            sensor_info[2],
-            sensor_info[3],
-            sensor_info[4],
-        )
-        entities.append(sensor)
-
-    # Socket 2 binary sensors (if available)
-    if hub.has_socket_2:
-        for sensor_info in BINARY_SENSOR_TYPES:
-            sensor = AlfenBinarySensor(
-                hub_name,
-                hub,
-                device_info,
-                2,
-                sensor_info[0],
-                sensor_info[1],
-                sensor_info[2],
-                sensor_info[3],
-                sensor_info[4],
-            )
-            entities.append(sensor)
-
-    async_add_entities(entities)
-    return True
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: AlfenConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the Alfen binary sensors."""
+    coordinator = entry.runtime_data
+    platform_name = entry.data[CONF_NAME]
+    async_add_entities(
+        AlfenBinarySensor(coordinator, platform_name, description, number)
+        for number in coordinator.charger.sockets
+        for description in BINARY_SENSORS
+    )
 
 
 class AlfenBinarySensor(AlfenEntity, BinarySensorEntity):
-    """Representation of an Alfen Modbus binary sensor."""
+    """Whether a vehicle is plugged in, or drawing current."""
+
+    entity_description: AlfenBinarySensorDescription
 
     def __init__(
         self,
-        platform_name,
-        hub,
-        device_info,
-        socket,
-        name,
-        key,
-        device_class,
-        icon_on,
-        icon_off,
+        coordinator: AlfenCoordinator,
+        platform_name: str,
+        description: AlfenBinarySensorDescription,
+        number: int,
     ) -> None:
-        """Initialize the binary sensor."""
-        super().__init__(hub, device_info)
-        self._platform_name = platform_name
-        self._socket = socket
-        self._name = f"S{socket} {name}" if hub.has_socket_2 else name
-        self._key = f"socket_{socket}_{key}"
-        self._attr_device_class = device_class
-        self._icon_on = icon_on
-        self._icon_off = icon_off
-
-    @property
-    def name(self) -> str:
-        """Return the name."""
-        return f"{self._platform_name} {self._name}"
-
-    @property
-    def unique_id(self) -> Optional[str]:
-        """Return unique ID."""
-        return f"{self._platform_name}_{self._key}"
+        """Initialize the binary sensor for socket ``number``."""
+        label = description.name
+        if len(coordinator.charger.sockets) > 1:
+            label = f"S{number} {label}"
+        super().__init__(
+            coordinator, platform_name, description.key.format(n=number), label
+        )
+        self.entity_description = description
+        self._number = number
 
     @property
     def is_on(self) -> bool:
-        """Return true if the binary sensor is on."""
-        if self._key in self._hub.data:
-            return self._hub.data[self._key] == 1
-        return False
+        """Return whether the socket reports this state."""
+        socket = self.coordinator.charger.sockets[self._number]
+        return bool(self.entity_description.is_on_fn(socket))
 
     @property
     def icon(self) -> str:
-        """Return the icon based on state."""
-        return self._icon_on if self.is_on else self._icon_off
+        """Return the icon matching the current state."""
+        description = self.entity_description
+        return description.icon_on if self.is_on else description.icon_off

@@ -1,36 +1,41 @@
-"""Entities for the Alfen Modbus integration."""
+"""Base entity for the Alfen Modbus integration."""
 
-from homeassistant.core import callback
+from __future__ import annotations
+
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity import Entity, EntityDescription
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from . import AlfenModbusHub
+from .const import ATTR_MANUFACTURER, DOMAIN
+from .coordinator import AlfenCoordinator
 
 
-class AlfenEntity(Entity):
-    """Representation of an Alfen Modbus entity."""
+class AlfenEntity(CoordinatorEntity[AlfenCoordinator]):
+    """An entity backed by one poll of the charging station.
 
-    # _attr_has_entity_name = True
-    _attr_should_poll = False
+    Names and unique ids keep the ``<config name> <label>`` shape the
+    integration has always used, so upgrading does not orphan entities.
+    """
+
+    _attr_has_entity_name = False
 
     def __init__(
         self,
-        hub: AlfenModbusHub,
-        device_info: DeviceInfo,
+        coordinator: AlfenCoordinator,
+        platform_name: str,
+        key: str,
+        label: str,
     ) -> None:
-        """Initialize the Alfen Modbus entity."""
-        self._hub = hub
-        self._attr_device_info = device_info
-
-    async def async_added_to_hass(self) -> None:
-        """Register callbacks."""
-        self._hub.async_add_alfen_sensor(self._modbus_data_updated)
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Remove callbacks."""
-        self._hub.async_remove_alfen_sensor(self._modbus_data_updated)
-
-    @callback
-    def _modbus_data_updated(self) -> None:
-        """Handle updated data from the hub."""
-        self.async_write_ha_state()
+        """Initialize the entity under ``platform_name``."""
+        super().__init__(coordinator)
+        self._platform_name = platform_name
+        self._attr_unique_id = f"{platform_name}_{key}"
+        self._attr_name = f"{platform_name} {label}"
+        product = coordinator.charger.station.product
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, platform_name)},
+            name=platform_name,
+            manufacturer=ATTR_MANUFACTURER,
+            model=product.platform_type or "Unknown",
+            sw_version=product.firmware_version or "Unknown",
+            serial_number=product.serial_number or None,
+        )

@@ -1,25 +1,32 @@
+"""Config flow for the Alfen Modbus integration."""
+
+from __future__ import annotations
+
 import ipaddress
 import logging
 import re
+from typing import Any
 
 import voluptuous as vol
-from pymodbus.client import ModbusTcpClient
-
 from homeassistant import config_entries
-from homeassistant.const import CONF_NAME, CONF_HOST, CONF_PORT, CONF_SCAN_INTERVAL
+from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, CONF_SCAN_INTERVAL
+from homeassistant.core import HomeAssistant, callback
+from modbus_connection import ModbusError
+
+from .alfen import async_read_product
+from .connection import build_connection
 from .const import (
-    DOMAIN,
-    DEFAULT_NAME,
-    DEFAULT_SCAN_INTERVAL,
-    DEFAULT_PORT,
-    DEFAULT_MODBUS_ADDRESS,
     CONF_MODBUS_ADDRESS,
     CONF_READ_SCN,
     CONF_READ_SOCKET2,
+    DEFAULT_MODBUS_ADDRESS,
+    DEFAULT_NAME,
+    DEFAULT_PORT,
     DEFAULT_READ_SCN,
     DEFAULT_READ_SOCKET2,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
 )
-from homeassistant.core import HomeAssistant, callback
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,19 +53,25 @@ def host_valid(host):
         return all(x and not disallowed.search(x) for x in host.split("."))
 
 
-async def async_test_connection(hass: HomeAssistant, host: str, port: int) -> bool:
-    """Test if we can connect to the Modbus device."""
+async def async_test_connection(
+    hass: HomeAssistant, host: str, port: int, station_unit: int
+) -> bool:
+    """Return whether the station answers on its identification registers.
+
+    A bare TCP connect proves nothing here: the station listens on 502 whether
+    or not Modbus reading is licensed and switched on, so the check reads the
+    product block the integration actually needs.
+    """
+    connection = build_connection({CONF_HOST: host, CONF_PORT: port})
     try:
-        client = ModbusTcpClient(host=host, port=port)
-        # Run connection test in executor to avoid blocking
-        result = await hass.async_add_executor_job(client.connect)
-        if result:
-            await hass.async_add_executor_job(client.close)
-            return True
+        await async_read_product(connection.for_unit(station_unit))
+    except ModbusError as err:
+        _LOGGER.debug("Connection test failed: %s", err)
         return False
-    except Exception as e:
-        _LOGGER.debug("Connection test failed: %s", e)
-        return False
+    else:
+        return True
+    finally:
+        await connection.close()
 
 
 @callback
@@ -87,22 +100,23 @@ class AlfenModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return True
         return False
 
-    async def async_step_user(self, user_input=None):
+    async def async_step_user(self, user_input: dict[str, Any] | None = None):
         """Handle the initial step."""
         errors = {}
 
         if user_input is not None:
             host = user_input[CONF_HOST]
             port = user_input[CONF_PORT]
+            station_unit = user_input.get(CONF_MODBUS_ADDRESS, DEFAULT_MODBUS_ADDRESS)
 
             if self._host_in_configuration_exists(host):
                 errors[CONF_HOST] = "already_configured"
-            elif not host_valid(user_input[CONF_HOST]):
+            elif not host_valid(host):
                 errors[CONF_HOST] = "invalid_host"
-            elif not await async_test_connection(self.hass, host, port):
+            elif not await async_test_connection(self.hass, host, port, station_unit):
                 errors["base"] = "cannot_connect"
             else:
-                await self.async_set_unique_id(user_input[CONF_HOST])
+                await self.async_set_unique_id(host)
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
                     title=user_input[CONF_NAME], data=user_input
@@ -116,26 +130,28 @@ class AlfenModbusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class AlfenModbusOptionsFlowHandler(config_entries.OptionsFlow):
     """Handle Alfen Modbus options."""
 
-    async def async_step_init(self, user_input=None):
+    async def async_step_init(self, user_input: dict[str, Any] | None = None):
         """Manage the options."""
         errors = {}
+        data = self.config_entry.data
 
         if user_input is not None:
-            # Test connection if host/port changed
-            current_host = self.config_entry.data.get(CONF_HOST)
-            current_port = self.config_entry.data.get(CONF_PORT, DEFAULT_PORT)
+            current_host = data.get(CONF_HOST)
+            current_port = data.get(CONF_PORT, DEFAULT_PORT)
             new_host = user_input.get(CONF_HOST, current_host)
             new_port = user_input.get(CONF_PORT, current_port)
 
             if new_host != current_host or new_port != current_port:
-                if not await async_test_connection(self.hass, new_host, new_port):
+                station_unit = data.get(CONF_MODBUS_ADDRESS, DEFAULT_MODBUS_ADDRESS)
+                if not await async_test_connection(
+                    self.hass, new_host, new_port, station_unit
+                ):
                     errors["base"] = "cannot_connect"
 
             if not errors:
                 # Merge options into data for reload
-                new_data = {**self.config_entry.data, **user_input}
                 self.hass.config_entries.async_update_entry(
-                    self.config_entry, data=new_data
+                    self.config_entry, data={**data, **user_input}
                 )
                 # Reload the integration to apply changes
                 await self.hass.config_entries.async_reload(self.config_entry.entry_id)
@@ -144,29 +160,18 @@ class AlfenModbusOptionsFlowHandler(config_entries.OptionsFlow):
         # Build schema with current values as defaults
         options_schema = vol.Schema(
             {
-                vol.Required(
-                    CONF_HOST,
-                    default=self.config_entry.data.get(CONF_HOST, ""),
-                ): str,
-                vol.Required(
-                    CONF_PORT,
-                    default=self.config_entry.data.get(CONF_PORT, DEFAULT_PORT),
-                ): int,
+                vol.Required(CONF_HOST, default=data.get(CONF_HOST, "")): str,
+                vol.Required(CONF_PORT, default=data.get(CONF_PORT, DEFAULT_PORT)): int,
                 vol.Optional(
                     CONF_SCAN_INTERVAL,
-                    default=self.config_entry.data.get(
-                        CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
-                    ),
+                    default=data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
                 ): int,
                 vol.Optional(
-                    CONF_READ_SCN,
-                    default=self.config_entry.data.get(CONF_READ_SCN, DEFAULT_READ_SCN),
+                    CONF_READ_SCN, default=data.get(CONF_READ_SCN, DEFAULT_READ_SCN)
                 ): bool,
                 vol.Optional(
                     CONF_READ_SOCKET2,
-                    default=self.config_entry.data.get(
-                        CONF_READ_SOCKET2, DEFAULT_READ_SOCKET2
-                    ),
+                    default=data.get(CONF_READ_SOCKET2, DEFAULT_READ_SOCKET2),
                 ): bool,
             }
         )
@@ -174,4 +179,3 @@ class AlfenModbusOptionsFlowHandler(config_entries.OptionsFlow):
         return self.async_show_form(
             step_id="init", data_schema=options_schema, errors=errors
         )
-

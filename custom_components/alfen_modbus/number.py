@@ -1,152 +1,84 @@
+"""The per-socket max-current setpoint."""
+
+from __future__ import annotations
+
 import logging
-from typing import Optional, Dict, Any
 
-from .const import (
-    DOMAIN,
-    ATTR_MANUFACTURER,
-    CONTROL_SLAVE_MAX_CURRENT,
-)
+from homeassistant.components.number import NumberEntity, NumberMode
+from homeassistant.const import CONF_NAME, UnitOfElectricCurrent
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from homeassistant.const import CONF_NAME
-from homeassistant.components.number import NumberEntity
-
-from homeassistant.core import callback
-
+from .coordinator import AlfenConfigEntry, AlfenCoordinator
 from .entity import AlfenEntity
 
 _LOGGER = logging.getLogger(__name__)
 
-async def async_setup_entry(hass, entry, async_add_entities) -> None:
-    hub_name = entry.data[CONF_NAME]
-    hub = hass.data[DOMAIN][hub_name]["hub"]
+# Ceiling for the slider until the station reports its own (register 1100);
+# 32 A is the largest current an NG9xx socket hands out.
+FALLBACK_MAX_CURRENT = 32.0
 
-    device_info = {
-        "identifiers": {(DOMAIN, hub_name)},
-        "name": hub_name,
-        "manufacturer": ATTR_MANUFACTURER,
-        "model": hub.data.get("platformType", "Unknown"),
-        "sw_version": hub.data.get("firmwareVersion", "Unknown"),
-    }
 
-    entities = []
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: AlfenConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up a max-current number per socket."""
+    coordinator = entry.runtime_data
+    platform_name = entry.data[CONF_NAME]
+    async_add_entities(
+        AlfenMaxCurrent(coordinator, platform_name, number)
+        for number in coordinator.charger.sockets
+    )
 
-    for number_info in CONTROL_SLAVE_MAX_CURRENT:
-        number = AlfenNumber(
-            hub_name,
-            hub,
-            device_info,
-            1,
-            number_info[0],
-            number_info[1],
-            number_info[2],
-            number_info[3],
-            number_info[4],
-        )
-        entities.append(number)
-        
-    if hub.has_socket_2:
-        for number_info in CONTROL_SLAVE_MAX_CURRENT:
-            number = AlfenNumber(
-                hub_name,
-                hub,
-                device_info,
-                2,
-                number_info[0],
-                number_info[1],
-                number_info[2],
-                number_info[3],
-                number_info[4],
-            )
-            entities.append(number)
 
-    async_add_entities(entities)
-    return True
+class AlfenMaxCurrent(AlfenEntity, NumberEntity):
+    """The Modbus current setpoint for one socket (registers 1210-1211).
 
-class AlfenNumber(NumberEntity):
-    """Representation of an Alfen Modbus number."""
+    Writing it also restarts the station's validity timer; the coordinator
+    rewrites it before that timer lapses, so the socket keeps the setpoint
+    instead of falling back to its safe current.
+    """
 
-    def __init__(self,
-                 platform_name,
-                 hub,
-                 device_info,
-                 socket,
-                 name,
-                 key,
-                 register,
-                 fmt,
-                 attrs
+    _attr_native_min_value = 0
+    _attr_native_step = 0.1
+    _attr_native_unit_of_measurement = UnitOfElectricCurrent.AMPERE
+    _attr_mode = NumberMode.SLIDER
+
+    def __init__(
+        self, coordinator: AlfenCoordinator, platform_name: str, number: int
     ) -> None:
-        """Initialize the number."""
-        super().__init__(hub, device_info)
-        self._platform_name = platform_name
-        self._name = name+str(socket)
-        self._socket = socket
-        self._key = key+str(socket)
-        self._register = register
-        self._fmt = fmt
-        self._attr_native_min_value = attrs["min"]
-        self._attr_native_max_value = attrs["max"]
-        if "unit" in attrs.keys():
-            self._attr_native_unit_of_measurement = attrs["unit"]
-        if "mode" in attrs.keys():
-            self._attr_mode = attrs["mode"]
-        if "step" in attrs.keys():
-            self._attr_native_step = attrs["step"]
-
-    async def async_added_to_hass(self) -> None:
-        """Register callbacks."""
-        self._hub.async_add_alfen_sensor(self._modbus_data_updated, self.update_value)
-
-    async def async_will_remove_from_hass(self) -> None:
-        self._hub.async_remove_alfen_sensor(self._modbus_data_updated, self.update_value)
+        """Initialize the setpoint for socket ``number``."""
+        super().__init__(
+            coordinator,
+            platform_name,
+            f"maxCurrent_socket_{number}",
+            f"Max Current Limit S{number}",
+        )
+        self._number = number
 
     @property
-    def name(self) -> str:
-        """Return the name."""
-        return f"{self._platform_name} {self._name}"
+    def native_max_value(self) -> float:
+        """The station's own max current, which no socket may exceed."""
+        return self.coordinator.charger.station.status.max_current or (
+            FALLBACK_MAX_CURRENT
+        )
 
     @property
-    def unique_id(self) -> Optional[str]:
-        return f"{self._platform_name}_{self._key}"
-
-    @property
-    def native_value(self) -> float:
-        if self._key in self._hub.data:
-            return self._hub.data[self._key]
-
-    async def update_value(self):
-        if self._key not in self._hub.data:
-            _LOGGER.debug("Key %s not in hub data, skipping update_value", self._key)
-            return
-        value = self._hub.data[self._key]
-        
-        # Use actualMaxCurrent (Register 1100) as the hard limit for the slider
-        if "actualMaxCurrent" in self._hub.data:
-            self._attr_native_max_value = self._hub.data["actualMaxCurrent"]
-        elif "MAX_CURRENT_S"+str(self._socket) in self._hub.data:
-             # Fallback to previous logic if actualMaxCurrent not available
-            self._attr_native_max_value = self._hub.data["MAX_CURRENT_S"+str(self._socket)]
-            
-        _LOGGER.debug("Updating value to: %f",value)
-
-        if self._fmt == "u":
-            payload = self._hub._client.convert_to_registers(int(value), data_type=self._hub._client.DATATYPE.UINT16, word_order="big")
-        elif self._fmt == "f":
-            payload = self._hub._client.convert_to_registers(float(value), data_type=self._hub._client.DATATYPE.FLOAT32, word_order="big")
-
-        await self._hub.write_registers(unit=self._socket, address=self._register, payload=payload)
-
+    def native_value(self) -> float | None:
+        """The setpoint the socket is currently holding."""
+        return self.coordinator.charger.sockets[self._number].status.max_current
 
     async def async_set_native_value(self, value: float) -> None:
-        """Change the selected value."""
-        # Clamp value to actualMaxCurrent if available
-        if "actualMaxCurrent" in self._hub.data:
-            max_allowed = self._hub.data["actualMaxCurrent"]
-            if value > max_allowed:
-                _LOGGER.warning("Requested value %s exceeds max current %s, clamping.", value, max_allowed)
-                value = max_allowed
-
-        self._hub.data[self._key] = value
-        await self.update_value()       
-        self.hass.async_create_task(self._hub.async_refresh_modbus_data())
-        self.async_write_ha_state()
+        """Write a new setpoint, clamped to what the station allows."""
+        if value > (allowed := self.native_max_value):
+            _LOGGER.warning(
+                "Requested %s A exceeds the station's max current %s A, clamping",
+                value,
+                allowed,
+            )
+            value = allowed
+        socket = self.coordinator.charger.sockets[self._number]
+        await socket.async_set_max_current(value)
+        await self.coordinator.async_request_refresh()
