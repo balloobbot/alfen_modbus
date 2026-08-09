@@ -28,6 +28,20 @@ Home Assistant integration for **Alfen Eve NG9xx** series EV chargers via Modbus
   - **Active Load Balancing** license enabled
 - Modbus TCP enabled on the charger
 
+## Architecture
+
+The integration talks to the charger through
+[modbus-connection](https://home-assistant-libs.github.io/modbus-connection/). An
+Alfen station is **one TCP link carrying several Modbus units** — the station's
+own registers answer on slave 200, and each socket answers on slave 1 or 2 — so
+the integration opens a single connection and addresses each unit through
+`for_unit()`.
+
+The register map lives in `custom_components/alfen_modbus/alfen/`, a device
+library with no Home Assistant imports: it declares each register block as a
+typed component and is tested against modbus-connection's in-memory mock, with
+no charger and no Home Assistant in the loop.
+
 ## Installation
 
 ### HACS (Recommended)
@@ -81,6 +95,17 @@ See the [Alfen Smart Charging Manual](https://knowledge.alfen.com/space/IN/63976
 
 - Power budget may reset to 0A when no car is connected (fixed in firmware [6.4.0-4210](https://knowledge.alfen.com/space/IN/243466257))
 - **Reallin power meter (post-2021)**: Chargers with a Reallin power meter produced after 2021 only export a subset of measurement values. Per-phase energy, apparent energy, and reactive energy sensors will show as "unavailable" (NaN). This is a hardware limitation, not a bug.
+
+## Development
+
+```bash
+uv sync         # dev environment, including Home Assistant
+uv run pytest   # device library + integration tests, no hardware needed
+```
+
+`simulator/` runs a fake Alfen station to test against; see
+[`MIGRATION-NOTES.md`](MIGRATION-NOTES.md) for how the register map is modelled
+and what changed when the integration moved to modbus-connection.
 
 ## Contributing
 
