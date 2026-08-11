@@ -132,6 +132,33 @@ async def test_every_field_fits_inside_a_declared_readable_range(
             )
 
 
+async def test_declared_ranges_on_a_unit_never_touch(
+    connection: MockModbusConnection,
+) -> None:
+    """What keeps each block its own read is the gap, not the separate range.
+
+    Since 4.5 a group merges its members' maps by the addresses they name, so
+    ranges that touch describe one readable run and a read may span them.
+    ``(1100, 1105)`` beside a hypothetical ``(1106, ...)`` would be planned as
+    one span, and the station refuses a read reaching outside a block it
+    serves. Every pair here is separated by an address no component claims.
+    """
+    charger = AlfenCharger(connection, socket_numbers=(1,), read_scn=True)
+    per_unit = [
+        [charger.station.product, charger.station.status, charger.station.scn],
+        [charger.sockets[1].meter, charger.sockets[1].status],
+    ]
+
+    for components in per_unit:
+        declared = sorted(
+            block
+            for component in components
+            for block in (component.register_ranges or ())
+        )
+        for (_, high), (low, _) in zip(declared, declared[1:], strict=False):
+            assert low > high + 1, f"({low}, ...) touches (..., {high})"
+
+
 async def test_raw_registers_are_keyed_by_unit(
     connection: MockModbusConnection,
 ) -> None:
