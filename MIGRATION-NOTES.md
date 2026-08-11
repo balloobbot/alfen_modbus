@@ -2,7 +2,7 @@
 
 Notes from porting this integration off raw pymodbus onto
 [modbus-connection](https://github.com/home-assistant-libs/modbus-connection)
-4.3.0. Two things made this repo interesting to migrate: it is genuinely
+4.4.0. Two things made this repo interesting to migrate: it is genuinely
 **multi-unit** (the station and each socket are separate Modbus slaves on one TCP
 link — the canonical `for_unit()` case), and it needs **FC16 forced on a
 single-register write**.
@@ -267,6 +267,12 @@ confirmed it by asserting on `mock_modbus_unit.read_events` after a poll. That
 works, but it tells you what *happened*, not what *will* happen: there is no way
 for a device library to assert its read cost without a mock and a round trip, and
 no way to see the plan at all while writing the map.
+
+4.4's `resolved_fields` closes half of this: where each *field* lands is now
+readable off the component, with no I/O, which is what
+`AlfenCharger.layout` and the readable-range test are built on. What is still
+only observable through the mock is the *blocks* — how those fields pool into
+reads, and how wide each one ends up.
 
 **Ask:** expose the planned blocks — `group.blocks()` or `component.read_plan()` —
 so a device library can unit-test "this map is N reads, none wider than 125"

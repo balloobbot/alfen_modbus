@@ -18,6 +18,10 @@ async def async_get_config_entry_diagnostics(
     Read fresh from the device, and keyed by unit as well as address space —
     the station and each socket are separate units whose register numbers
     overlap, so an address alone does not identify a register here.
+
+    ``layout`` says which field each of those addresses belongs to, straight
+    off the register map, so a dump can be read without the vendor table. It
+    needs no I/O, so it is there even when the read fails.
     """
     coordinator = entry.runtime_data
     try:
@@ -32,5 +36,6 @@ async def async_get_config_entry_diagnostics(
             "read_socket_2": entry.data.get("read_socket_2"),
             "scan_interval": entry.data.get("scan_interval"),
         },
+        "layout": coordinator.charger.layout,
         "registers": registers,
     }

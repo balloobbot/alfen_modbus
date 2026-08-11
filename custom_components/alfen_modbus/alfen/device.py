@@ -9,17 +9,37 @@ the reads of components that share one unit.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from modbus_connection import ModbusConnection, ModbusUnit
-from modbus_connection.model import ComponentGroup
+from modbus_connection.model import Component, ComponentGroup
 
 from .components import Product, Scn, SocketMeter, SocketStatus, StationStatus
 from .enums import CHARGING_STATES, DISCONNECTED_STATES, Phases
 
 DEFAULT_STATION_UNIT = 200
 """Slave id the spec assigns to the station's own registers."""
+
+
+def _layout(components: Iterable[Component]) -> dict[str, dict[str, Any]]:
+    """Where each declared field of ``components`` lands on the device.
+
+    Read off ``Component.resolved_fields`` rather than restated here, so it
+    cannot drift from the map. Keyed ``Component.field`` because the component
+    names overlap — the station's ``Product.name`` and ``Scn.name`` are
+    different registers.
+    """
+    return {
+        f"{type(component).__name__}.{name}": {
+            "space": resolved.space,
+            "address": resolved.address,
+            "count": resolved.count,
+        }
+        for component in components
+        for name, resolved in component.resolved_fields.items()
+    }
 
 
 async def async_read_product(unit: ModbusUnit) -> Product:
@@ -42,9 +62,10 @@ class AlfenStation:
         self.product = Product(unit)
         self.status = StationStatus(unit)
         self.scn = Scn(unit) if read_scn else None
-        components = [self.product, self.status]
+        components: list[Component] = [self.product, self.status]
         if self.scn is not None:
             components.append(self.scn)
+        self._components = components
         self._group = ComponentGroup(unit, components)
 
     async def async_update(self) -> None:
@@ -54,6 +75,11 @@ class AlfenStation:
     async def async_read_raw(self) -> dict[str, dict[int, int | bool]]:
         """Read every station register undecoded, keyed by space and address."""
         return await self._group.async_read_raw()
+
+    @property
+    def layout(self) -> dict[str, dict[str, Any]]:
+        """Where each station field sits; no I/O, so always available."""
+        return _layout(self._components)
 
     @property
     def time(self) -> datetime | None:
@@ -119,6 +145,11 @@ class AlfenSocket:
     async def async_read_raw(self) -> dict[str, dict[int, int | bool]]:
         """Read every socket register undecoded, keyed by space and address."""
         return await self._group.async_read_raw()
+
+    @property
+    def layout(self) -> dict[str, dict[str, Any]]:
+        """Where each socket field sits; no I/O, so always available."""
+        return _layout([self.meter, self.status])
 
     @property
     def vehicle_connected(self) -> bool | None:
@@ -260,3 +291,21 @@ class AlfenCharger:
             for space, values in (await socket.async_read_raw()).items():
                 raw[f"socket_{socket.number}/{space}"] = values
         return raw
+
+    @property
+    def layout(self) -> dict[str, dict[str, Any]]:
+        """Where every field this device declares sits, keyed like the raw dump.
+
+        What makes a raw dump readable: it is addresses, and which register is
+        which is otherwise only in the vendor table. Every configured socket is
+        listed, including one the station does not report — the layout is
+        derived from the map, not from a read, so it costs nothing and is there
+        whether or not the unit answered.
+        """
+        return {
+            "station": self.station.layout,
+            **{
+                f"socket_{number}": socket.layout
+                for number, socket in self.sockets.items()
+            },
+        }

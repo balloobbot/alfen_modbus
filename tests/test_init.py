@@ -129,6 +129,24 @@ async def test_diagnostics_separate_the_units(
     assert diagnostics["entry"]["modbus_address"] == STATION_UNIT
 
 
+async def test_diagnostics_say_which_field_each_address_is(
+    hass: HomeAssistant, setup_integration: MockConfigEntry
+) -> None:
+    """The raw dump is addresses; the layout is what makes them readable."""
+    diagnostics = await async_get_config_entry_diagnostics(hass, setup_integration)
+
+    layout = diagnostics["layout"]
+    assert set(layout) == {"station", "socket_1"}
+    assert layout["station"]["Product.serial_number"] == {
+        "space": "holding",
+        "address": 157,
+        "count": 11,
+    }
+    # The two units both serve register 300, and the layout keeps them apart.
+    assert layout["socket_1"]["SocketMeter.meter_state"]["address"] == 300
+    assert "SocketMeter.meter_state" not in layout["station"]
+
+
 @pytest.mark.parametrize(
     "entity_id",
     [

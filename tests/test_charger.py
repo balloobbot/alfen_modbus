@@ -100,6 +100,38 @@ async def test_skips_a_socket_the_station_does_not_report(
     assert charger.sockets[2].meter.voltage_l1_n is None
 
 
+async def test_every_field_fits_inside_a_declared_readable_range(
+    connection: MockModbusConnection,
+) -> None:
+    """A declared map must contain every field, or the planner refuses to plan.
+
+    Since 4.4 a field the map cannot hold raises at plan-build time rather than
+    being read as its own block the station would refuse. Every component here
+    declares ``register_ranges``, so this checks the map against where the
+    fields actually resolve — and names the offender when it does not.
+    """
+    charger = AlfenCharger(connection, socket_numbers=(1,), read_scn=True)
+    components = [
+        charger.station.product,
+        charger.station.status,
+        charger.station.scn,
+        charger.sockets[1].meter,
+        charger.sockets[1].status,
+    ]
+
+    for component in components:
+        ranges = component.register_ranges
+        assert ranges is not None
+        for name, resolved in component.resolved_fields.items():
+            last = resolved.address + resolved.count - 1
+            assert any(
+                low <= resolved.address and last <= high for low, high in ranges
+            ), (
+                f"{type(component).__name__}.{name} at "
+                f"{resolved.address}-{last} is outside {ranges}"
+            )
+
+
 async def test_raw_registers_are_keyed_by_unit(
     connection: MockModbusConnection,
 ) -> None:
