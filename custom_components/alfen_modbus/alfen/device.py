@@ -13,11 +13,17 @@ from collections.abc import Iterable, Iterator, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from modbus_connection import ModbusConnection, ModbusUnit
+from modbus_connection import (
+    ModbusConnection,
+    ModbusConnectionError,
+    ModbusError,
+    ModbusUnit,
+)
 from modbus_connection.model import Component, ComponentGroup
 
 from .components import Product, Scn, SocketMeter, SocketStatus, StationStatus
 from .enums import CHARGING_STATES, DISCONNECTED_STATES, Phases
+from .model import UpdateReport
 
 DEFAULT_STATION_UNIT = 200
 """Slave id the spec assigns to the station's own registers."""
@@ -54,7 +60,48 @@ async def async_read_product(unit: ModbusUnit) -> Product:
     return product
 
 
-class AlfenStation:
+class _PolledUnit:
+    """One Modbus unit's components, refreshed one at a time.
+
+    A pooled ``ComponentGroup`` update is all-or-nothing: the first block the
+    station refuses aborts the rest and discards what was already read. A poll
+    reads each component on its own instead, so a refused or slow block costs
+    only its own component's values.
+    """
+
+    _polled: dict[str, Component]
+
+    async def async_update(self, *, notify: bool = True) -> UpdateReport:
+        """Refresh this unit's components, one read at a time.
+
+        A component whose read fails keeps its previous values by construction,
+        does not notify, and is named in the report with its error. Listeners
+        fire only after every component was tried; ``notify=False`` hands that
+        to the caller, which is what lets a whole-charger poll settle first. A
+        dead link raises ``ModbusConnectionError`` rather than being reported.
+        """
+        updated: set[str] = set()
+        failed: dict[str, ModbusError] = {}
+        for name, component in self._polled.items():
+            try:
+                await component.async_update(notify=False)
+            except ModbusConnectionError:
+                raise
+            except ModbusError as err:
+                failed[name] = err
+            else:
+                updated.add(name)
+        if notify:
+            self.notify(updated)
+        return UpdateReport(updated, failed)
+
+    def notify(self, names: Iterable[str]) -> None:
+        """Fire the update listeners of the named components."""
+        for name in names:
+            self._polled[name].notify()
+
+
+class AlfenStation(_PolledUnit):
     """The station unit: identification, status, and optionally SCN."""
 
     def __init__(self, unit: ModbusUnit, *, read_scn: bool = False) -> None:
@@ -62,15 +109,15 @@ class AlfenStation:
         self.product = Product(unit)
         self.status = StationStatus(unit)
         self.scn = Scn(unit) if read_scn else None
-        components: list[Component] = [self.product, self.status]
+        self._polled: dict[str, Component] = {
+            "product": self.product,
+            "status": self.status,
+        }
         if self.scn is not None:
-            components.append(self.scn)
-        self._components = components
-        self._group = ComponentGroup(unit, components)
-
-    async def async_update(self) -> None:
-        """Refresh the station in one pooled read per register block."""
-        await self._group.async_update()
+            self._polled["scn"] = self.scn
+        # The group plans the pooled reads a raw dump takes; a poll reads the
+        # same components one at a time, so one refused block contains itself.
+        self._group = ComponentGroup(unit, self._polled.values())
 
     async def async_read_raw(self) -> dict[str, dict[int, int | bool]]:
         """Read every station register undecoded, keyed by space and address."""
@@ -79,7 +126,7 @@ class AlfenStation:
     @property
     def layout(self) -> dict[str, dict[str, Any]]:
         """Where each station field sits; no I/O, so always available."""
-        return _layout(self._components)
+        return _layout(self._polled.values())
 
     @property
     def time(self) -> datetime | None:
@@ -123,7 +170,7 @@ class AlfenStation:
         return (now - timedelta(milliseconds=uptime)).replace(microsecond=0)
 
 
-class AlfenSocket:
+class AlfenSocket(_PolledUnit):
     """One socket unit: its energy meter, its status, and its session."""
 
     def __init__(self, unit: ModbusUnit, number: int) -> None:
@@ -131,16 +178,16 @@ class AlfenSocket:
         self.number = number
         self.meter = SocketMeter(unit)
         self.status = SocketStatus(unit)
-        self._group = ComponentGroup(unit, [self.meter, self.status])
+        self._polled: dict[str, Component] = {
+            "meter": self.meter,
+            "status": self.status,
+        }
+        self._group = ComponentGroup(unit, self._polled.values())
         self.session_energy: float | None = None
         self.session_duration: timedelta | None = None
         self._session_start: datetime | None = None
         self._session_start_energy: float | None = None
         self._charging = False
-
-    async def async_update(self) -> None:
-        """Refresh this socket in one pooled read per register block."""
-        await self._group.async_update()
 
     async def async_read_raw(self) -> dict[str, dict[int, int | bool]]:
         """Read every socket register undecoded, keyed by space and address."""
@@ -149,7 +196,7 @@ class AlfenSocket:
     @property
     def layout(self) -> dict[str, dict[str, Any]]:
         """Where each socket field sits; no I/O, so always available."""
-        return _layout([self.meter, self.status])
+        return _layout(self._polled.values())
 
     @property
     def vehicle_connected(self) -> bool | None:
@@ -253,20 +300,35 @@ class AlfenCharger:
             if number == 1 or (count is not None and number <= count):
                 yield socket
 
-    async def async_update(self) -> None:
+    async def async_update(self) -> UpdateReport:
         """Refresh the station, then every socket it reports.
 
         The station goes first: its socket count decides which socket units are
         worth talking to, and its clock is what the session figures are
         measured against.
 
-        Raises ``ModbusError`` if any unit fails to answer.
+        Every component is read on its own, so a block one unit refuses or is
+        slow to answer costs only that component: it keeps its previous values
+        and is named in the report with its error, while the rest still
+        refresh. Listeners fire once the whole charger has been polled. Only a
+        dead link raises ``ModbusConnectionError``.
         """
-        await self.station.async_update()
+        polls: list[tuple[str, _PolledUnit, UpdateReport]] = [
+            ("station", self.station, await self.station.async_update(notify=False))
+        ]
         station_time = self.station.time
         for socket in self:
-            await socket.async_update()
+            report = await socket.async_update(notify=False)
             socket.update_session(station_time)
+            polls.append((f"socket_{socket.number}", socket, report))
+
+        updated: set[str] = set()
+        failed: dict[str, ModbusError] = {}
+        for prefix, unit, report in polls:
+            unit.notify(report.updated)
+            updated |= {f"{prefix}.{name}" for name in report.updated}
+            failed |= {f"{prefix}.{name}": err for name, err in report.failed.items()}
+        return UpdateReport(updated, failed)
 
     async def async_renew_setpoints(self, *, within: float) -> None:
         """Keep every socket's current setpoint from lapsing."""

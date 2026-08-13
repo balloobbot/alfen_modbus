@@ -14,6 +14,7 @@ from .device import (
     async_read_product,
 )
 from .enums import CHARGING_STATES, DISCONNECTED_STATES, MeterState, MeterType, Phases
+from .model import UpdateReport
 
 __all__ = [
     "CHARGING_STATES",
@@ -30,5 +31,6 @@ __all__ = [
     "SocketMeter",
     "SocketStatus",
     "StationStatus",
+    "UpdateReport",
     "async_read_product",
 ]
