@@ -137,7 +137,7 @@ async def test_a_failed_block_keeps_its_sensors_on_their_previous_values(
     assert hass.states.get("sensor.alfen_voltage_l1_n").state == "232.5"
 
 
-async def test_a_charger_that_answers_nothing_goes_unavailable(
+async def test_a_charger_that_answers_nothing_takes_every_instantaneous_sensor_down(
     hass: HomeAssistant,
     setup_integration: MockConfigEntry,
     mock_connection: MockModbusConnection,
@@ -149,5 +149,39 @@ async def test_a_charger_that_answers_nothing_goes_unavailable(
     await setup_integration.runtime_data.async_refresh()
     await hass.async_block_till_done()
 
+    # Instantaneous readings only. A stale voltage is a lie; a stale counter is
+    # the truth, so the energy totals are exempt (see below).
     assert hass.states.get("sensor.alfen_mode_3_state").state == STATE_UNAVAILABLE
     assert hass.states.get("sensor.alfen_voltage_l1_n").state == STATE_UNAVAILABLE
+
+
+async def test_an_unreachable_charger_leaves_the_energy_totals_standing(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_connection: MockModbusConnection,
+) -> None:
+    """A charger off the network overnight must not gap its statistics."""
+    for unit in POLLED_UNITS:
+        mock_connection.for_unit(unit).fail_requests(ModbusTimeoutError("powered down"))
+
+    await setup_integration.runtime_data.async_refresh()
+    await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.alfen_real_energy_delivered_sum").state == "45745.98"
+    assert hass.states.get("sensor.alfen_voltage_l1_n").state == STATE_UNAVAILABLE
+
+
+async def test_an_energy_total_that_reads_nan_holds_its_last_value(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_connection: MockModbusConnection,
+) -> None:
+    """A NaN register arrives through a *successful* poll, past availability."""
+    # Spec §1.2: a reserved or unavailable register answers 0xFFFF words, which
+    # decode to None — unknown would gap statistics just as badly as offline.
+    mock_connection.for_unit(1).holding[374] = [0xFFFF] * 4
+
+    await setup_integration.runtime_data.async_refresh()
+    await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.alfen_real_energy_delivered_sum").state == "45745.98"

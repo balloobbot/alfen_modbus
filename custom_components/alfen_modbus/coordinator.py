@@ -23,8 +23,9 @@ class AlfenCoordinator(DataUpdateCoordinator[None]):
     """Poll the station and its sockets, and keep their setpoints alive.
 
     A dropped link is not an entry reload: the connection re-establishes itself
-    on the next request, so a failed poll marks the entities unavailable and the
-    next successful one brings them back.
+    on the next request, so a failed poll marks the instantaneous entities
+    unavailable and the next successful one brings them back. Accumulators are
+    exempt and hold their last value, to keep long-term statistics unbroken.
     """
 
     def __init__(

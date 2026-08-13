@@ -609,6 +609,8 @@ async def async_setup_entry(
 class AlfenSensor(AlfenEntity, SensorEntity):
     """Shared rounding for the station's float readings."""
 
+    _held_total: Any = None
+
     def _rounded(self, value: Any) -> Any:
         """Round a reading to two decimals, as this integration always has.
 
@@ -616,6 +618,46 @@ class AlfenSensor(AlfenEntity, SensorEntity):
         232.50000762939453; two decimals is all the meter resolves anyway.
         """
         return round(value, 2) if isinstance(value, float) else value
+
+    @property
+    def _is_accumulator(self) -> bool:
+        """Whether this sensor feeds long-term statistics.
+
+        Read off the resolved ``state_class`` rather than the description, so a
+        subclass setting ``_attr_state_class`` is covered too.
+        """
+        return self.state_class in (
+            SensorStateClass.TOTAL,
+            SensorStateClass.TOTAL_INCREASING,
+        )
+
+    @property
+    def available(self) -> bool:
+        """Keep accumulators available; let instantaneous readings drop out.
+
+        An unavailable counter gaps its long-term statistics and its energy
+        dashboard, and a charger is legitimately off the network for a night.
+        The trade: an accumulator never reads unavailable even if the charger
+        is gone for good. That is intended — for a counter, statistics
+        continuity beats liveness, which belongs on a connectivity entity.
+        """
+        if self._is_accumulator:
+            return True
+        return super().available
+
+    def _accumulated(self, value: Any) -> Any:
+        """Hold an accumulator's last reading instead of publishing unknown.
+
+        A reserved or absent register answers NaN, which decodes to None
+        (spec §1.2) — through a *successful* poll, so staying available never
+        covers it. Unknown gaps statistics just as badly as unavailable.
+        """
+        if not self._is_accumulator:
+            return value
+        if value is None:
+            return self._held_total
+        self._held_total = value
+        return value
 
 
 class AlfenStationSensor(AlfenSensor):
@@ -636,7 +678,9 @@ class AlfenStationSensor(AlfenSensor):
     @property
     def native_value(self) -> Any:
         """Return the station reading."""
-        return self._rounded(self.entity_description.value_fn(self.coordinator.charger))
+        return self._accumulated(
+            self._rounded(self.entity_description.value_fn(self.coordinator.charger))
+        )
 
 
 class AlfenSocketSensor(AlfenSensor):
@@ -667,4 +711,6 @@ class AlfenSocketSensor(AlfenSensor):
     def native_value(self) -> Any:
         """Return the socket reading."""
         socket = self.coordinator.charger.sockets[self._number]
-        return self._rounded(self.entity_description.value_fn(socket))
+        return self._accumulated(
+            self._rounded(self.entity_description.value_fn(socket))
+        )
