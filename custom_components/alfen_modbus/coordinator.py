@@ -53,7 +53,15 @@ class AlfenCoordinator(DataUpdateCoordinator[None]):
     async def _async_update_data(self) -> None:
         """Read every unit, then renew any setpoint about to lapse."""
         try:
-            await self.charger.async_update()
+            report = await self.charger.async_update()
             await self.charger.async_renew_setpoints(within=self._renewal_margin)
         except ModbusError as err:
             raise UpdateFailed(f"Error talking to the charging station: {err}") from err
+        if not report.updated:
+            raise UpdateFailed(
+                f"The charging station answered nothing: {report.failed}"
+            )
+        if report.failed:
+            # A refused or slow block keeps its own sensors on their previous
+            # values while the rest refresh, so this is the only trace of it.
+            _LOGGER.debug("Kept previous values for %s", report.failed)
