@@ -42,6 +42,13 @@ library with no Home Assistant imports: it declares each register block as a
 typed component and is tested against modbus-connection's in-memory mock, with
 no charger and no Home Assistant in the loop.
 
+A poll reads each block on its own, so one block the station refuses or is slow
+to answer does not take the rest of the poll with it: that block's sensors keep
+their previous values while every other block refreshes, and `async_update()`
+returns an `UpdateReport` naming the failed ones (`station.product`,
+`socket_1.meter`) with their errors. Only a dead link raises — and a poll that
+refreshed nothing at all still marks the entities unavailable.
+
 ## Installation
 
 ### HACS (Recommended)
