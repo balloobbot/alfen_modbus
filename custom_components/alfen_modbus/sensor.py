@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any
 
 from homeassistant.components.sensor import (
+    RestoreSensor,
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
@@ -24,7 +26,7 @@ from homeassistant.const import (
     UnitOfTemperature,
     UnitOfTime,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .alfen import AlfenCharger, AlfenSocket, MeterState, MeterType, Phases
@@ -67,18 +69,36 @@ def _seconds(value: Any) -> float | None:
 
 
 @dataclass(frozen=True, kw_only=True)
-class AlfenStationSensorDescription(SensorEntityDescription):
+class AlfenSensorDescription(SensorEntityDescription):
+    """What every Alfen sensor description carries."""
+
+    component: str
+    """The block this sensor reads from, as the update report names it."""
+
+    @cached_property
+    def is_total(self) -> bool:
+        """Whether this sensor accumulates rather than measures."""
+        return self.state_class in (
+            SensorStateClass.TOTAL,
+            SensorStateClass.TOTAL_INCREASING,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class AlfenStationSensorDescription(AlfenSensorDescription):
     """A sensor reading a value off the station's own units."""
 
     value_fn: Callable[[AlfenCharger], Any]
 
 
 @dataclass(frozen=True, kw_only=True)
-class AlfenSocketSensorDescription(SensorEntityDescription):
+class AlfenSocketSensorDescription(AlfenSensorDescription):
     """A sensor reading a value off one socket unit.
 
     ``key`` is a template: the socket number fills ``{n}``, which reproduces the
     unique ids the integration has used since before the sockets were modelled.
+    ``component`` is unit-local for the same reason: the socket number qualifies
+    it when the entity is built.
     """
 
     value_fn: Callable[[AlfenSocket], Any]
@@ -87,48 +107,57 @@ class AlfenSocketSensorDescription(SensorEntityDescription):
 STATION_SENSORS: tuple[AlfenStationSensorDescription, ...] = (
     AlfenStationSensorDescription(
         key="name",
+        component="station.product",
         name="Name",
         value_fn=lambda charger: charger.station.product.name,
     ),
     AlfenStationSensorDescription(
         key="manufacturer",
+        component="station.product",
         name="Manufacturer",
         value_fn=lambda charger: charger.station.product.manufacturer,
     ),
     AlfenStationSensorDescription(
         key="modbustableVersion",
+        component="station.product",
         name="Modbus table version",
         value_fn=lambda charger: charger.station.product.modbus_table_version,
     ),
     AlfenStationSensorDescription(
         key="firmwareVersion",
+        component="station.product",
         name="Firmware version",
         value_fn=lambda charger: charger.station.product.firmware_version,
     ),
     AlfenStationSensorDescription(
         key="platformType",
+        component="station.product",
         name="Platform Type",
         value_fn=lambda charger: charger.station.product.platform_type,
     ),
     AlfenStationSensorDescription(
         key="serial",
+        component="station.product",
         name="Serial",
         value_fn=lambda charger: charger.station.product.serial_number,
     ),
     AlfenStationSensorDescription(
         key="stationTime",
+        component="station.product",
         name="Current time",
         device_class=SensorDeviceClass.TIMESTAMP,
         value_fn=lambda charger: charger.station.time,
     ),
     AlfenStationSensorDescription(
         key="lastBoot",
+        component="station.product",
         name="Last boot",
         device_class=SensorDeviceClass.TIMESTAMP,
         value_fn=lambda charger: charger.station.last_boot,
     ),
     AlfenStationSensorDescription(
         key="actualMaxCurrent",
+        component="station.status",
         name="Actual max current",
         icon="mdi:current-dc",
         native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
@@ -138,6 +167,7 @@ STATION_SENSORS: tuple[AlfenStationSensorDescription, ...] = (
     ),
     AlfenStationSensorDescription(
         key="boardTemperature",
+        component="station.status",
         name="Board temperature",
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         device_class=SensorDeviceClass.TEMPERATURE,
@@ -146,11 +176,13 @@ STATION_SENSORS: tuple[AlfenStationSensorDescription, ...] = (
     ),
     AlfenStationSensorDescription(
         key="backofficeConnected",
+        component="station.status",
         name="Backoffice connected",
         value_fn=lambda charger: charger.station.status.backoffice_connected,
     ),
     AlfenStationSensorDescription(
         key="numberOfSockets",
+        component="station.status",
         name="Number of sockets",
         value_fn=lambda charger: charger.station.status.socket_count,
     ),
@@ -159,11 +191,13 @@ STATION_SENSORS: tuple[AlfenStationSensorDescription, ...] = (
 SCN_SENSORS: tuple[AlfenStationSensorDescription, ...] = (
     AlfenStationSensorDescription(
         key="scnName",
+        component="station.scn",
         name="SCN Name",
         value_fn=lambda charger: charger.station.scn and charger.station.scn.name,
     ),
     AlfenStationSensorDescription(
         key="scnSockets",
+        component="station.scn",
         name="Number of SCN sockets",
         value_fn=(
             lambda charger: charger.station.scn and charger.station.scn.socket_count
@@ -219,11 +253,13 @@ _REACTIVE_ENERGY = {
 SOCKET_SENSORS: tuple[AlfenSocketSensorDescription, ...] = (
     AlfenSocketSensorDescription(
         key="socket_{n}_meterstate",
+        component="meter",
         name="Meter state",
         value_fn=lambda socket: _meter_state_label(socket.meter.meter_state),
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_meterAge",
+        component="meter",
         name="Meter reading age",
         native_unit_of_measurement=UnitOfTime.MILLISECONDS,
         device_class=SensorDeviceClass.DURATION,
@@ -232,101 +268,118 @@ SOCKET_SENSORS: tuple[AlfenSocketSensorDescription, ...] = (
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_meterType",
+        component="meter",
         name="Meter Type",
         value_fn=lambda socket: METER_TYPE_LABELS.get(socket.meter.meter_type),
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_VL1-N",
+        component="meter",
         name="Voltage L1-N",
         value_fn=lambda socket: socket.meter.voltage_l1_n,
         **_VOLTAGE,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_VL2-N",
+        component="meter",
         name="Voltage L2-N",
         value_fn=lambda socket: socket.meter.voltage_l2_n,
         **_VOLTAGE,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_VL3-N",
+        component="meter",
         name="Voltage L3-N",
         value_fn=lambda socket: socket.meter.voltage_l3_n,
         **_VOLTAGE,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_VL1-L2",
+        component="meter",
         name="Voltage L1-L2",
         value_fn=lambda socket: socket.meter.voltage_l1_l2,
         **_VOLTAGE,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_VL2-L3",
+        component="meter",
         name="Voltage L2-L3",
         value_fn=lambda socket: socket.meter.voltage_l2_l3,
         **_VOLTAGE,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_VL3-L1",
+        component="meter",
         name="Voltage L3-L1",
         value_fn=lambda socket: socket.meter.voltage_l3_l1,
         **_VOLTAGE,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_currentN",
+        component="meter",
         name="Current N",
         value_fn=lambda socket: socket.meter.current_n,
         **_CURRENT,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_currentL1",
+        component="meter",
         name="Current L1",
         value_fn=lambda socket: socket.meter.current_l1,
         **_CURRENT,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_currentL2",
+        component="meter",
         name="Current L2",
         value_fn=lambda socket: socket.meter.current_l2,
         **_CURRENT,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_currentL3",
+        component="meter",
         name="Current L3",
         value_fn=lambda socket: socket.meter.current_l3,
         **_CURRENT,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_currentSum",
+        component="meter",
         name="Current Total",
         value_fn=lambda socket: socket.meter.current_sum,
         **_CURRENT,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_powerL1",
+        component="meter",
         name="Power factor L1",
         value_fn=lambda socket: socket.meter.power_factor_l1,
         **_POWER_FACTOR,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_powerL2",
+        component="meter",
         name="Power factor L2",
         value_fn=lambda socket: socket.meter.power_factor_l2,
         **_POWER_FACTOR,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_powerL3",
+        component="meter",
         name="Power factor L3",
         value_fn=lambda socket: socket.meter.power_factor_l3,
         **_POWER_FACTOR,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_powerSum",
+        component="meter",
         name="Power factor sum",
         value_fn=lambda socket: socket.meter.power_factor_sum,
         **_POWER_FACTOR,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_frequency",
+        component="meter",
         name="Frequency",
         native_unit_of_measurement=UnitOfFrequency.HERTZ,
         device_class=SensorDeviceClass.FREQUENCY,
@@ -335,190 +388,222 @@ SOCKET_SENSORS: tuple[AlfenSocketSensorDescription, ...] = (
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_realPowerL1",
+        component="meter",
         name="Real power L1",
         value_fn=lambda socket: socket.meter.real_power_l1,
         **_REAL_POWER,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_realPowerL2",
+        component="meter",
         name="Real power L2",
         value_fn=lambda socket: socket.meter.real_power_l2,
         **_REAL_POWER,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_realPowerL3",
+        component="meter",
         name="Real power L3",
         value_fn=lambda socket: socket.meter.real_power_l3,
         **_REAL_POWER,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_realPowerSum",
+        component="meter",
         name="Real power sum",
         value_fn=lambda socket: socket.meter.real_power_sum,
         **_REAL_POWER,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_apparantPowerL1",
+        component="meter",
         name="Apparant power L1",
         value_fn=lambda socket: socket.meter.apparent_power_l1,
         **_APPARENT_POWER,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_apparantPowerL2",
+        component="meter",
         name="Apparant power L2",
         value_fn=lambda socket: socket.meter.apparent_power_l2,
         **_APPARENT_POWER,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_apparantPowerL3",
+        component="meter",
         name="Apparant power L3",
         value_fn=lambda socket: socket.meter.apparent_power_l3,
         **_APPARENT_POWER,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_apparantPowerSum",
+        component="meter",
         name="Apparant power sum",
         value_fn=lambda socket: socket.meter.apparent_power_sum,
         **_APPARENT_POWER,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_reactivePowerL1",
+        component="meter",
         name="Reactive power L1",
         value_fn=lambda socket: socket.meter.reactive_power_l1,
         **_REACTIVE_POWER,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_reactivePowerL2",
+        component="meter",
         name="Reactive power L2",
         value_fn=lambda socket: socket.meter.reactive_power_l2,
         **_REACTIVE_POWER,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_reactivePowerL3",
+        component="meter",
         name="Reactive power L3",
         value_fn=lambda socket: socket.meter.reactive_power_l3,
         **_REACTIVE_POWER,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_reactivePowerSum",
+        component="meter",
         name="Reactive power sum",
         value_fn=lambda socket: socket.meter.reactive_power_sum,
         **_REACTIVE_POWER,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_realEnergyDeliveredL1",
+        component="meter",
         name="Real energy delivered L1",
         value_fn=lambda socket: socket.meter.real_energy_delivered_l1,
         **_REAL_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_realEnergyDeliveredL2",
+        component="meter",
         name="Real energy delivered L2",
         value_fn=lambda socket: socket.meter.real_energy_delivered_l2,
         **_REAL_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_realEnergyDeliveredL3",
+        component="meter",
         name="Real energy delivered L3",
         value_fn=lambda socket: socket.meter.real_energy_delivered_l3,
         **_REAL_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_realEnergyDeliveredSum",
+        component="meter",
         name="Real energy delivered sum",
         value_fn=lambda socket: socket.meter.real_energy_delivered_sum,
         **_REAL_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_realEnergyConsumedL1",
+        component="meter",
         name="Real energy consumed L1",
         value_fn=lambda socket: socket.meter.real_energy_consumed_l1,
         **_REAL_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_realEnergyConsumedL2",
+        component="meter",
         name="Real energy consumed L2",
         value_fn=lambda socket: socket.meter.real_energy_consumed_l2,
         **_REAL_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_realEnergyConsumedL3",
+        component="meter",
         name="Real energy consumed L3",
         value_fn=lambda socket: socket.meter.real_energy_consumed_l3,
         **_REAL_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_realEnergyConsumedSum",
+        component="meter",
         name="Real energy consumed sum",
         value_fn=lambda socket: socket.meter.real_energy_consumed_sum,
         **_REAL_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_apparantEnergyL1",
+        component="meter",
         name="Apparant energy L1",
         value_fn=lambda socket: socket.meter.apparent_energy_l1,
         **_APPARENT_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_apparantEnergyL2",
+        component="meter",
         name="Apparant energy L2",
         value_fn=lambda socket: socket.meter.apparent_energy_l2,
         **_APPARENT_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_apparantEnergyL3",
+        component="meter",
         name="Apparant energy L3",
         value_fn=lambda socket: socket.meter.apparent_energy_l3,
         **_APPARENT_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_apparantEnergySum",
+        component="meter",
         name="Apparant energy sum",
         value_fn=lambda socket: socket.meter.apparent_energy_sum,
         **_APPARENT_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_reactiveEnergyL1",
+        component="meter",
         name="Reactive energy L1",
         value_fn=lambda socket: socket.meter.reactive_energy_l1,
         **_REACTIVE_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_reactiveEnergyL2",
+        component="meter",
         name="Reactive energy L2",
         value_fn=lambda socket: socket.meter.reactive_energy_l2,
         **_REACTIVE_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_reactiveEnergyL3",
+        component="meter",
         name="Reactive energy L3",
         value_fn=lambda socket: socket.meter.reactive_energy_l3,
         **_REACTIVE_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_reactiveEnergySum",
+        component="meter",
         name="Reactive energy sum",
         value_fn=lambda socket: socket.meter.reactive_energy_sum,
         **_REACTIVE_ENERGY,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_available",
+        component="status",
         name="Availability",
         value_fn=lambda socket: _availability_label(socket.status.available),
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_mode3state",
+        component="status",
         name="Mode 3 State",
         value_fn=lambda socket: socket.status.mode3_state,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_actualMaxCurrent",
+        component="status",
         name="Actual applied max current",
         value_fn=lambda socket: socket.status.actual_max_current,
         **_CURRENT,
     ),
     AlfenSocketSensorDescription(
         key="maxCurrentValidTime_socket_{n}",
+        component="status",
         name="Max current valid time",
         native_unit_of_measurement=UnitOfTime.SECONDS,
         device_class=SensorDeviceClass.DURATION,
@@ -527,38 +612,45 @@ SOCKET_SENSORS: tuple[AlfenSocketSensorDescription, ...] = (
     ),
     AlfenSocketSensorDescription(
         key="maxCurrent_socket_{n}",
+        component="status",
         name="Max current",
         value_fn=lambda socket: socket.status.max_current,
         **_CURRENT,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_saveCurrent",
+        component="status",
         name="Active load balacing safe current",
         value_fn=lambda socket: socket.status.safe_current,
         **_CURRENT,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_setpointAccounted",
+        component="status",
         name="Received SP accounted for",
         value_fn=lambda socket: socket.status.setpoint_accounted,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_chargephases",
+        component="status",
         name="Charging Mode",
         value_fn=lambda socket: PHASE_LABELS.get(socket.status.phases),
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_carcharging",
+        component="status",
         name="Car charging",
         value_fn=lambda socket: socket.charging,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_carconnected",
+        component="status",
         name="Car connected",
         value_fn=lambda socket: socket.vehicle_connected,
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_currentSession",
+        component="meter",
         name="Current session Wh",
         native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
@@ -567,6 +659,7 @@ SOCKET_SENSORS: tuple[AlfenSocketSensorDescription, ...] = (
     ),
     AlfenSocketSensorDescription(
         key="socket_{n}_currentSessionDuration",
+        component="status",
         name="Current session duration",
         native_unit_of_measurement=UnitOfTime.SECONDS,
         device_class=SensorDeviceClass.DURATION,
@@ -606,10 +699,14 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class AlfenSensor(AlfenEntity, SensorEntity):
-    """Shared rounding for the station's float readings."""
+class AlfenSensor(AlfenEntity, RestoreSensor):
+    """Shared value handling for the charger's readings."""
 
-    _held_total: Any = None
+    entity_description: AlfenSensorDescription
+
+    def _read_value(self) -> Any:
+        """The reading this sensor is over, straight off the device."""
+        raise NotImplementedError
 
     def _rounded(self, value: Any) -> Any:
         """Round a reading to two decimals, as this integration always has.
@@ -620,44 +717,43 @@ class AlfenSensor(AlfenEntity, SensorEntity):
         return round(value, 2) if isinstance(value, float) else value
 
     @property
-    def _is_accumulator(self) -> bool:
-        """Whether this sensor feeds long-term statistics.
-
-        Read off the resolved ``state_class`` rather than the description, so a
-        subclass setting ``_attr_state_class`` is covered too.
-        """
-        return self.state_class in (
-            SensorStateClass.TOTAL,
-            SensorStateClass.TOTAL_INCREASING,
-        )
-
-    @property
     def available(self) -> bool:
-        """Keep accumulators available; let instantaneous readings drop out.
+        """Keep totals available; let instantaneous readings drop out.
 
         An unavailable counter gaps its long-term statistics and its energy
         dashboard, and a charger is legitimately off the network for a night.
-        The trade: an accumulator never reads unavailable even if the charger
-        is gone for good. That is intended — for a counter, statistics
-        continuity beats liveness, which belongs on a connectivity entity.
+        The trade: a total never reads unavailable even if the charger is gone
+        for good. That is intended — for a counter, statistics continuity beats
+        liveness, which belongs on a connectivity entity.
         """
-        if self._is_accumulator:
-            return True
-        return super().available
+        return self.entity_description.is_total or super().available
 
-    def _accumulated(self, value: Any) -> Any:
-        """Hold an accumulator's last reading instead of publishing unknown.
+    async def async_added_to_hass(self) -> None:
+        """Seed a total from the state it had before the restart."""
+        await super().async_added_to_hass()
+        if (
+            self.entity_description.is_total
+            and (last_data := await self.async_get_last_sensor_data()) is not None
+        ):
+            self._attr_native_value = last_data.native_value
+        self._process_data()
 
-        A reserved or absent register answers NaN, which decodes to None
-        (spec §1.2) — through a *successful* poll, so staying available never
-        covers it. Unknown gaps statistics just as badly as unavailable.
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._process_data()
+        super()._handle_coordinator_update()
+
+    def _process_data(self) -> None:
+        """Take the reading, unless a total has nothing to take.
+
+        A reserved or absent register answers NaN, which decodes to None (spec
+        §1.2) — through a *successful* poll, so staying available never covers
+        it. Unknown gaps statistics just as badly as unavailable, so a total
+        keeps what it had.
         """
-        if not self._is_accumulator:
-            return value
-        if value is None:
-            return self._held_total
-        self._held_total = value
-        return value
+        value = self._rounded(self._read_value())
+        if value is not None or not self.entity_description.is_total:
+            self._attr_native_value = value
 
 
 class AlfenStationSensor(AlfenSensor):
@@ -672,15 +768,18 @@ class AlfenStationSensor(AlfenSensor):
         description: AlfenStationSensorDescription,
     ) -> None:
         """Initialize the sensor from its description."""
-        super().__init__(coordinator, platform_name, description.key, description.name)
+        super().__init__(
+            coordinator,
+            platform_name,
+            description.key,
+            description.name,
+            description.component,
+        )
         self.entity_description = description
 
-    @property
-    def native_value(self) -> Any:
+    def _read_value(self) -> Any:
         """Return the station reading."""
-        return self._accumulated(
-            self._rounded(self.entity_description.value_fn(self.coordinator.charger))
-        )
+        return self.entity_description.value_fn(self.coordinator.charger)
 
 
 class AlfenSocketSensor(AlfenSensor):
@@ -702,15 +801,17 @@ class AlfenSocketSensor(AlfenSensor):
         if len(coordinator.charger.sockets) > 1:
             label = f"S{number} {label}"
         super().__init__(
-            coordinator, platform_name, description.key.format(n=number), label
+            coordinator,
+            platform_name,
+            description.key.format(n=number),
+            label,
+            f"socket_{number}.{description.component}",
         )
         self.entity_description = description
         self._number = number
 
-    @property
-    def native_value(self) -> Any:
+    def _read_value(self) -> Any:
         """Return the socket reading."""
-        socket = self.coordinator.charger.sockets[self._number]
-        return self._accumulated(
-            self._rounded(self.entity_description.value_fn(socket))
+        return self.entity_description.value_fn(
+            self.coordinator.charger.sockets[self._number]
         )

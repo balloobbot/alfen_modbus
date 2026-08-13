@@ -8,12 +8,17 @@ its own so that costs only its own values, and the poll says which ones.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 from homeassistant.const import STATE_UNAVAILABLE
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State
 from modbus_connection import ModbusConnectionError, ModbusTimeoutError
 from modbus_connection.mock import MockModbusConnection
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    mock_restore_cache_with_extra_data,
+)
 
 from custom_components.alfen_modbus.alfen import AlfenCharger
 
@@ -121,12 +126,12 @@ async def test_every_component_refreshes_on_a_healthy_charger(
     }
 
 
-async def test_a_failed_block_keeps_its_sensors_on_their_previous_values(
+async def test_a_failed_block_takes_only_its_own_sensors_down(
     hass: HomeAssistant,
     setup_integration: MockConfigEntry,
     mock_connection: MockModbusConnection,
 ) -> None:
-    """The entities of a refused block stay put; the others still refresh."""
+    """A refused block's entities drop out; the others still refresh."""
     mock_connection.for_unit(1).fail_read(300, ModbusTimeoutError("slow meter"))
     mock_connection.for_unit(1).holding[1201] = text("B2", 5)
 
@@ -134,7 +139,10 @@ async def test_a_failed_block_keeps_its_sensors_on_their_previous_values(
     await hass.async_block_till_done()
 
     assert hass.states.get("sensor.alfen_mode_3_state").state == "B2"
-    assert hass.states.get("sensor.alfen_voltage_l1_n").state == "232.5"
+    # The meter is the failed block: a stale voltage would be a lie, but its
+    # totals are exempt, because a gap damages long-term statistics.
+    assert hass.states.get("sensor.alfen_voltage_l1_n").state == STATE_UNAVAILABLE
+    assert hass.states.get("sensor.alfen_real_energy_delivered_sum").state == "45745.98"
 
 
 async def test_a_charger_that_answers_nothing_takes_every_instantaneous_sensor_down(
@@ -169,6 +177,52 @@ async def test_an_unreachable_charger_leaves_the_energy_totals_standing(
 
     assert hass.states.get("sensor.alfen_real_energy_delivered_sum").state == "45745.98"
     assert hass.states.get("sensor.alfen_voltage_l1_n").state == STATE_UNAVAILABLE
+
+
+async def test_a_charger_that_answers_nothing_says_what_it_failed_on(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_connection: MockModbusConnection,
+) -> None:
+    """Home Assistant logs str(err), so silence alone tells the user nothing."""
+    for unit in POLLED_UNITS:
+        mock_connection.for_unit(unit).fail_requests(ModbusTimeoutError("no answer"))
+
+    coordinator = setup_integration.runtime_data
+    await coordinator.async_refresh()
+
+    assert not coordinator.last_update_success
+    assert "no answer" in str(coordinator.last_exception)
+    # Every failure is kept, under the one that got named.
+    cause = coordinator.last_exception.__cause__
+    assert isinstance(cause, ExceptionGroup)
+    assert len(cause.exceptions) == 4
+
+
+async def test_an_energy_total_restores_across_a_restart(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    mock_connection: MockModbusConnection,
+) -> None:
+    """A total the charger cannot supply resumes from its stored state."""
+    mock_connection.for_unit(1).holding[374] = [0xFFFF] * 4  # reads NaN
+    mock_restore_cache_with_extra_data(
+        hass,
+        (
+            (
+                State("sensor.alfen_real_energy_delivered_sum", "12345.0"),
+                {"native_value": 12345.0, "native_unit_of_measurement": "Wh"},
+            ),
+        ),
+    )
+
+    with patch(
+        "custom_components.alfen_modbus.build_connection", return_value=mock_connection
+    ):
+        assert await hass.config_entries.async_setup(config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.alfen_real_energy_delivered_sum").state == "12345.0"
 
 
 async def test_an_energy_total_that_reads_nan_holds_its_last_value(

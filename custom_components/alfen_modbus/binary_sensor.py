@@ -83,7 +83,11 @@ class AlfenBinarySensor(AlfenEntity, BinarySensorEntity):
         if len(coordinator.charger.sockets) > 1:
             label = f"S{number} {label}"
         super().__init__(
-            coordinator, platform_name, description.key.format(n=number), label
+            coordinator,
+            platform_name,
+            description.key.format(n=number),
+            label,
+            f"socket_{number}.status",  # both read the mode 3 state
         )
         self.entity_description = description
         self._number = number

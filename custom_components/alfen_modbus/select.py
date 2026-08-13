@@ -46,6 +46,7 @@ class AlfenPhaseSelect(AlfenEntity, SelectEntity):
             platform_name,
             f"usephases_S{number}",
             f"Usable phases{number}",
+            f"socket_{number}.status",
         )
         self._number = number
 

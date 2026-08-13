@@ -43,11 +43,14 @@ typed component and is tested against modbus-connection's in-memory mock, with
 no charger and no Home Assistant in the loop.
 
 A poll reads each block on its own, so one block the station refuses or is slow
-to answer does not take the rest of the poll with it: that block's sensors keep
-their previous values while every other block refreshes, and `async_update()`
-returns an `UpdateReport` naming the failed ones (`station.product`,
-`socket_1.meter`) with their errors. Only a dead link raises — and a poll that
-refreshed nothing at all still marks the entities unavailable.
+to answer does not take the rest of the poll with it: `async_update()` returns
+an `UpdateReport` naming the failed ones (`station.product`, `socket_1.meter`)
+with their errors, and only that block's own entities go unavailable while
+every other block refreshes. Only a dead link raises.
+
+Energy totals are the exception: they hold their last value and restore it
+across a restart, so a charger that is off the network overnight — or a meter
+answering NaN — does not gap its long-term statistics.
 
 ## Installation
 

@@ -55,6 +55,7 @@ class AlfenMaxCurrent(AlfenEntity, NumberEntity):
             platform_name,
             f"maxCurrent_socket_{number}",
             f"Max Current Limit S{number}",
+            f"socket_{number}.status",
         )
         self._number = number
 
