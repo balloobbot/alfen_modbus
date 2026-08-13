@@ -22,6 +22,9 @@ async def async_get_config_entry_diagnostics(
     ``layout`` says which field each of those addresses belongs to, straight
     off the register map, so a dump can be read without the vendor table. It
     needs no I/O, so it is there even when the read fails.
+
+    The last poll's outcome rides along: a dump on its own does not say which
+    blocks the entities are actually being fed from.
     """
     coordinator = entry.runtime_data
     try:
@@ -36,6 +39,8 @@ async def async_get_config_entry_diagnostics(
             "read_socket_2": entry.data.get("read_socket_2"),
             "scan_interval": entry.data.get("scan_interval"),
         },
+        "updated": sorted(coordinator.data.updated),
+        "failed": {name: str(err) for name, err in coordinator.data.failed.items()},
         "layout": coordinator.charger.layout,
         "registers": registers,
     }

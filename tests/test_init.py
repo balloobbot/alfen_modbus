@@ -9,7 +9,7 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import ATTR_ENTITY_ID, STATE_ON, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
-from modbus_connection import ModbusConnectionError
+from modbus_connection import ModbusConnectionError, ModbusTimeoutError
 from modbus_connection.mock import MockModbusConnection, WriteEvent
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -145,6 +145,22 @@ async def test_diagnostics_say_which_field_each_address_is(
     # The two units both serve register 300, and the layout keeps them apart.
     assert layout["socket_1"]["SocketMeter.meter_state"]["address"] == 300
     assert "SocketMeter.meter_state" not in layout["station"]
+
+
+async def test_diagnostics_say_what_the_last_poll_managed(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_connection: MockModbusConnection,
+) -> None:
+    """A register dump alone does not say which blocks feed the entities."""
+    mock_connection.for_unit(1).fail_read(300, ModbusTimeoutError("slow meter"))
+    await setup_integration.runtime_data.async_refresh()
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, setup_integration)
+
+    assert "station.status" in diagnostics["updated"]
+    assert "socket_1.meter" not in diagnostics["updated"]
+    assert "slow meter" in diagnostics["failed"]["socket_1.meter"]
 
 
 @pytest.mark.parametrize(
