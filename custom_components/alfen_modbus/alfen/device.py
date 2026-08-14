@@ -121,7 +121,7 @@ class AlfenStation(_PolledUnit):
 
     async def async_read_raw(self) -> dict[str, dict[int, int | bool]]:
         """Read every station register undecoded, keyed by space and address."""
-        return await self._group.async_read_raw()
+        return await self._group.async_read_raw(notify=False)
 
     @property
     def layout(self) -> dict[str, dict[str, Any]]:
@@ -191,7 +191,7 @@ class AlfenSocket(_PolledUnit):
 
     async def async_read_raw(self) -> dict[str, dict[int, int | bool]]:
         """Read every socket register undecoded, keyed by space and address."""
-        return await self._group.async_read_raw()
+        return await self._group.async_read_raw(notify=False)
 
     @property
     def layout(self) -> dict[str, dict[str, Any]]:
@@ -342,6 +342,9 @@ class AlfenCharger:
         ambiguous here: the station and both sockets are separate units on one
         link, and socket 1's register 300 is not socket 2's. The unit id is
         folded into the key to keep them apart.
+
+        A dump is not a poll: the reads refresh the fields, but no listener
+        fires, so downloading diagnostics does not look like an update cycle.
         """
         raw: dict[str, dict[int, int | bool]] = {}
         # The station goes first here too: its socket count is what decides

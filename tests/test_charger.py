@@ -146,6 +146,21 @@ async def test_raw_registers_are_keyed_by_unit(
     assert 300 not in raw["station/holding"]
 
 
+async def test_a_raw_dump_refreshes_without_notifying(
+    connection: MockModbusConnection,
+) -> None:
+    """Downloading diagnostics is not a poll, so no listener may see it."""
+    charger = AlfenCharger(connection, socket_numbers=(1,))
+    fired: list[str] = []
+    charger.station.status.add_update_listener(lambda: fired.append("station.status"))
+    charger.sockets[1].meter.add_update_listener(lambda: fired.append("socket_1.meter"))
+
+    await charger.async_read_raw()
+
+    assert not fired
+    assert charger.sockets[1].meter.voltage_l1_n == pytest.approx(232.5)
+
+
 # -- writes ------------------------------------------------------------------
 
 
