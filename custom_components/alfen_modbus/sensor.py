@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, partial
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -669,6 +669,16 @@ SOCKET_SENSORS: tuple[AlfenSocketSensorDescription, ...] = (
 )
 
 
+def _sensor_class(description: AlfenSensorDescription) -> type[_AlfenSensor]:
+    """The entity class this description calls for.
+
+    Only a total has to survive a restart, and Home Assistant writes every
+    entity inheriting ``RestoreEntity`` to its restore store on a timer — so a
+    plain reading does not carry the machinery.
+    """
+    return AlfenTotalSensor if description.is_total else AlfenSensor
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: AlfenConfigEntry,
@@ -679,62 +689,114 @@ async def async_setup_entry(
     platform_name = entry.data[CONF_NAME]
     charger = coordinator.charger
 
-    entities: list[SensorEntity] = [
-        AlfenStationSensor(coordinator, platform_name, description)
-        for description in STATION_SENSORS
-    ]
+    station_descriptions = list(STATION_SENSORS)
     if charger.station.scn is not None:
-        entities += [
-            AlfenStationSensor(coordinator, platform_name, description)
-            for description in SCN_SENSORS
-        ]
+        station_descriptions += SCN_SENSORS
+    entities: list[SensorEntity] = [
+        _sensor_class(description)(
+            coordinator,
+            platform_name,
+            description,
+            key=description.key,
+            label=description.name,
+            component=description.component,
+            read=partial(description.value_fn, charger),
+        )
+        for description in station_descriptions
+    ]
     # Every configured socket gets its entities, even one the station is not
     # reporting yet: a socket that never answers stays unknown rather than
     # disappearing from the dashboard.
-    entities += [
-        AlfenSocketSensor(coordinator, platform_name, description, number)
-        for number in charger.sockets
-        for description in SOCKET_SENSORS
-    ]
+    for number, socket in charger.sockets.items():
+        # A single-socket station has nothing to disambiguate, so it keeps the
+        # bare label the integration showed before dual sockets were supported.
+        prefix = f"S{number} " if len(charger.sockets) > 1 else ""
+        entities += [
+            _sensor_class(description)(
+                coordinator,
+                platform_name,
+                description,
+                key=description.key.format(n=number),
+                label=f"{prefix}{description.name}",
+                component=f"socket_{number}.{description.component}",
+                read=partial(description.value_fn, socket),
+            )
+            for description in SOCKET_SENSORS
+        ]
     async_add_entities(entities)
 
 
-class AlfenSensor(AlfenEntity, RestoreSensor):
-    """Shared value handling for the charger's readings."""
+class _AlfenSensor(AlfenEntity, SensorEntity):
+    """What both kinds of Alfen sensor share: the reading they are over.
+
+    The station and each socket are separate units, so where a sensor reads
+    from is settled when it is built — ``read`` is the description's value
+    function bound to the charger or to one socket, and the key, label and
+    report key are resolved the same way.
+    """
 
     entity_description: AlfenSensorDescription
 
-    def _read_value(self) -> Any:
-        """The reading this sensor is over, straight off the device."""
-        raise NotImplementedError
+    def __init__(
+        self,
+        coordinator: AlfenCoordinator,
+        platform_name: str,
+        description: AlfenSensorDescription,
+        *,
+        key: str,
+        label: str,
+        component: str,
+        read: Callable[[], Any],
+    ) -> None:
+        """Initialize the sensor over the reading ``read`` returns."""
+        super().__init__(coordinator, platform_name, key, label, component)
+        self.entity_description = description
+        self._read = read
 
-    def _rounded(self, value: Any) -> Any:
-        """Round a reading to two decimals, as this integration always has.
+    def _reading(self) -> Any:
+        """This sensor's value, rounded as this integration always has.
 
         The registers are IEEE floats, so an exact 232.5 V arrives as
         232.50000762939453; two decimals is all the meter resolves anyway.
         """
+        value = self._read()
         return round(value, 2) if isinstance(value, float) else value
+
+
+class AlfenSensor(_AlfenSensor):
+    """An instantaneous reading, straight off the last poll."""
+
+    @property
+    def native_value(self) -> Any:
+        """Whatever the last poll left on the device object."""
+        return self._reading()
+
+
+class AlfenTotalSensor(_AlfenSensor, RestoreSensor):
+    """A counter, which holds its last value and outlives the charger.
+
+    An unavailable counter gaps its long-term statistics and its energy
+    dashboard, and a charger is legitimately off the network for a night. The
+    trade: a total never reads unavailable even if the charger is gone for
+    good. That is intended — for a counter, statistics continuity beats
+    liveness, which belongs on a connectivity entity.
+    """
 
     @property
     def available(self) -> bool:
-        """Keep totals available; let instantaneous readings drop out.
+        """Always available.
 
-        An unavailable counter gaps its long-term statistics and its energy
-        dashboard, and a charger is legitimately off the network for a night.
-        The trade: a total never reads unavailable even if the charger is gone
-        for good. That is intended — for a counter, statistics continuity beats
-        liveness, which belongs on a connectivity entity.
+        A property rather than ``_attr_available``, because
+        ``CoordinatorEntity.available`` is a property too — a class attribute
+        would never be consulted, and the total would go unavailable exactly
+        when the charger answers nothing.
         """
-        return self.entity_description.is_total or super().available
+        return True
 
     async def async_added_to_hass(self) -> None:
-        """Seed a total from the state it had before the restart."""
+        """Seed the total from the state it had before the restart."""
         await super().async_added_to_hass()
-        if (
-            self.entity_description.is_total
-            and (last_data := await self.async_get_last_sensor_data()) is not None
-        ):
+        if (last_data := await self.async_get_last_sensor_data()) is not None:
             self._attr_native_value = last_data.native_value
         self._process_data()
 
@@ -744,74 +806,12 @@ class AlfenSensor(AlfenEntity, RestoreSensor):
         super()._handle_coordinator_update()
 
     def _process_data(self) -> None:
-        """Take the reading, unless a total has nothing to take.
+        """Take the reading, unless there is nothing to take.
 
         A reserved or absent register answers NaN, which decodes to None (spec
         §1.2) — through a *successful* poll, so staying available never covers
-        it. Unknown gaps statistics just as badly as unavailable, so a total
+        it. Unknown gaps statistics just as badly as unavailable, so the total
         keeps what it had.
         """
-        value = self._rounded(self._read_value())
-        if value is not None or not self.entity_description.is_total:
+        if (value := self._reading()) is not None:
             self._attr_native_value = value
-
-
-class AlfenStationSensor(AlfenSensor):
-    """A sensor over the station's identification, status or SCN registers."""
-
-    entity_description: AlfenStationSensorDescription
-
-    def __init__(
-        self,
-        coordinator: AlfenCoordinator,
-        platform_name: str,
-        description: AlfenStationSensorDescription,
-    ) -> None:
-        """Initialize the sensor from its description."""
-        super().__init__(
-            coordinator,
-            platform_name,
-            description.key,
-            description.name,
-            description.component,
-        )
-        self.entity_description = description
-
-    def _read_value(self) -> Any:
-        """Return the station reading."""
-        return self.entity_description.value_fn(self.coordinator.charger)
-
-
-class AlfenSocketSensor(AlfenSensor):
-    """A sensor over one socket unit's registers."""
-
-    entity_description: AlfenSocketSensorDescription
-
-    def __init__(
-        self,
-        coordinator: AlfenCoordinator,
-        platform_name: str,
-        description: AlfenSocketSensorDescription,
-        number: int,
-    ) -> None:
-        """Initialize the sensor for socket ``number``."""
-        # A single-socket station has nothing to disambiguate, so it keeps the
-        # bare label the integration showed before dual sockets were supported.
-        label = description.name
-        if len(coordinator.charger.sockets) > 1:
-            label = f"S{number} {label}"
-        super().__init__(
-            coordinator,
-            platform_name,
-            description.key.format(n=number),
-            label,
-            f"socket_{number}.{description.component}",
-        )
-        self.entity_description = description
-        self._number = number
-
-    def _read_value(self) -> Any:
-        """Return the socket reading."""
-        return self.entity_description.value_fn(
-            self.coordinator.charger.sockets[self._number]
-        )
