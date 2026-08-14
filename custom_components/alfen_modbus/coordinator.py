@@ -9,7 +9,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_SCAN_INTERVAL
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from modbus_connection import ModbusConnection, ModbusError
+from modbus_connection import ModbusConnection, ModbusError, ModbusTimeoutError
 
 from .alfen import AlfenCharger, UpdateReport
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, SETPOINT_RENEWAL_MARGIN
@@ -29,9 +29,14 @@ class AlfenCoordinator(DataUpdateCoordinator[UpdateReport]):
     on the next request, so a failed poll marks the instantaneous entities
     unavailable and the next successful one brings them back. Totals are exempt
     and hold their last value, to keep long-term statistics unbroken.
+
+    A link that stays up while the charger stops answering is the one case
+    reconnection cannot see, so the poll that times out with nothing answered
+    is counted and the link dropped once it keeps happening.
     """
 
     _failed: frozenset[str] = frozenset()
+    _timeouts: int = 0
 
     def __init__(
         self,
@@ -61,8 +66,17 @@ class AlfenCoordinator(DataUpdateCoordinator[UpdateReport]):
         try:
             report = await self.charger.async_update()
             await self.charger.async_renew_setpoints(within=self._renewal_margin)
+        except ModbusTimeoutError as err:
+            # Nothing answered at all. A bridge that keeps the socket open
+            # while the station behind it stops replying never heals on its
+            # own, so drop the link and let the next poll build a fresh one.
+            self._timeouts += 1
+            if self._timeouts >= 3:
+                await self.connection.disconnect()
+            raise UpdateFailed(f"Error talking to the charging station: {err}") from err
         except ModbusError as err:
             raise UpdateFailed(f"Error talking to the charging station: {err}") from err
+        self._timeouts = 0
         if not report.updated:
             # Home Assistant logs str(err) at error level and the traceback at
             # debug, so name a block that failed rather than only the silence.

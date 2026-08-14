@@ -13,7 +13,11 @@ from unittest.mock import patch
 import pytest
 from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant, State
-from modbus_connection import ModbusConnectionError, ModbusTimeoutError
+from modbus_connection import (
+    IllegalDataAddressError,
+    ModbusConnectionError,
+    ModbusTimeoutError,
+)
 from modbus_connection.mock import MockModbusConnection
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
@@ -22,7 +26,7 @@ from pytest_homeassistant_custom_component.common import (
 
 from custom_components.alfen_modbus.alfen import AlfenCharger
 
-from .registers import STATION_UNIT, f32, seed_socket, seed_station, text
+from .registers import STATION_UNIT, f32, f64, seed_socket, seed_station, text
 
 POLLED_UNITS = (STATION_UNIT, 1)
 
@@ -50,20 +54,48 @@ def reads(connection: MockModbusConnection) -> int:
 async def test_a_failed_component_leaves_the_rest_fresh(
     charger: AlfenCharger, connection: MockModbusConnection
 ) -> None:
+    """A block that is slow costs its own values once the station answered."""
     await charger.async_update()
-    before = charger.station.product.name
+    before = charger.station.status.max_current
 
     connection.for_unit(STATION_UNIT).holding[100] = text("Eve Double Pro-line", 17)
     connection.for_unit(STATION_UNIT).holding[1100] = f32(20.0)  # station derates
-    connection.for_unit(STATION_UNIT).fail_read(100, ModbusTimeoutError("slow block"))
+    connection.for_unit(STATION_UNIT).fail_read(1100, ModbusTimeoutError("slow block"))
     report = await charger.async_update()
 
     assert not report.complete
-    assert set(report.failed) == {"station.product"}
-    assert isinstance(report.failed["station.product"], ModbusTimeoutError)
-    assert {"station.status", "socket_1.meter"} <= report.updated
-    assert charger.station.product.name == before  # previous value kept
-    assert charger.station.status.max_current == 20.0
+    assert set(report.failed) == {"station.status"}
+    assert isinstance(report.failed["station.status"], ModbusTimeoutError)
+    assert {"station.product", "socket_1.meter"} <= report.updated
+    assert charger.station.status.max_current == before  # previous value kept
+    assert charger.station.product.name == "Eve Double Pro-line"
+
+
+async def test_a_charger_that_answers_nothing_raises_on_the_first_block(
+    charger: AlfenCharger, connection: MockModbusConnection
+) -> None:
+    """A silent station must cost one timeout, not one per block per unit."""
+    for unit in POLLED_UNITS:
+        connection.for_unit(unit).fail_requests(ModbusTimeoutError("no answer"))
+
+    with pytest.raises(ModbusTimeoutError):
+        await charger.async_update()
+
+    assert reads(connection) == 1
+
+
+async def test_a_refused_first_block_keeps_the_poll_going(
+    charger: AlfenCharger, connection: MockModbusConnection
+) -> None:
+    """A refusal proves the station is there, so a later timeout is contained."""
+    station = connection.for_unit(STATION_UNIT)
+    station.fail_read(100, IllegalDataAddressError(message="no ALB licence"))
+    station.fail_read(1100, ModbusTimeoutError("slow block"))
+
+    report = await charger.async_update()
+
+    assert set(report.failed) == {"station.product", "station.status"}
+    assert "socket_1.meter" in report.updated
 
 
 async def test_a_socket_that_stops_answering_leaves_the_station_fresh(
@@ -86,10 +118,10 @@ async def test_listeners_fire_at_the_end_and_only_for_fresh_components(
 ) -> None:
     await charger.async_update()
     seen: list[int] = []
-    charger.station.status.add_update_listener(lambda: seen.append(reads(connection)))
-    charger.station.product.add_update_listener(lambda: seen.append(-1))
+    charger.station.product.add_update_listener(lambda: seen.append(reads(connection)))
+    charger.station.status.add_update_listener(lambda: seen.append(-1))
 
-    connection.for_unit(STATION_UNIT).fail_read(100, ModbusTimeoutError("slow block"))
+    connection.for_unit(STATION_UNIT).fail_read(1100, ModbusTimeoutError("slow block"))
     for unit in POLLED_UNITS:
         connection.for_unit(unit).read_events.clear()
     await charger.async_update()
@@ -179,24 +211,62 @@ async def test_an_unreachable_charger_leaves_the_energy_totals_standing(
     assert hass.states.get("sensor.alfen_voltage_l1_n").state == STATE_UNAVAILABLE
 
 
-async def test_a_charger_that_answers_nothing_says_what_it_failed_on(
+async def test_a_charger_that_refuses_everything_says_what_it_failed_on(
     hass: HomeAssistant,
     setup_integration: MockConfigEntry,
     mock_connection: MockModbusConnection,
 ) -> None:
     """Home Assistant logs str(err), so silence alone tells the user nothing."""
     for unit in POLLED_UNITS:
-        mock_connection.for_unit(unit).fail_requests(ModbusTimeoutError("no answer"))
+        mock_connection.for_unit(unit).fail_requests(
+            IllegalDataAddressError(message="no ALB licence")
+        )
 
     coordinator = setup_integration.runtime_data
     await coordinator.async_refresh()
 
     assert not coordinator.last_update_success
-    assert "no answer" in str(coordinator.last_exception)
+    # The library names the block it refused, which is what makes the log usable.
+    assert "address 100" in str(coordinator.last_exception)
     # Every failure is kept, under the one that got named.
     cause = coordinator.last_exception.__cause__
     assert isinstance(cause, ExceptionGroup)
     assert len(cause.exceptions) == 4
+
+
+async def test_a_wedged_link_is_dropped_once_the_charger_keeps_timing_out(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_connection: MockModbusConnection,
+) -> None:
+    """A bridge that holds the socket open while the station is gone never heals."""
+    for unit in POLLED_UNITS:
+        mock_connection.for_unit(unit).fail_requests(ModbusTimeoutError("no answer"))
+    coordinator = setup_integration.runtime_data
+
+    with patch.object(mock_connection, "disconnect") as disconnect:
+        await coordinator.async_refresh()
+        await coordinator.async_refresh()
+        assert not disconnect.called
+        await coordinator.async_refresh()
+
+    assert disconnect.called
+
+
+async def test_a_contained_timeout_leaves_the_link_alone(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_connection: MockModbusConnection,
+) -> None:
+    """One slow block is not a wedged link: the rest of the charger answered."""
+    mock_connection.for_unit(1).fail_read(300, ModbusTimeoutError("slow meter"))
+    coordinator = setup_integration.runtime_data
+
+    with patch.object(mock_connection, "disconnect") as disconnect:
+        for _ in range(4):
+            await coordinator.async_refresh()
+
+    assert not disconnect.called
 
 
 async def test_an_energy_total_restores_across_a_restart(
@@ -239,3 +309,23 @@ async def test_an_energy_total_that_reads_nan_holds_its_last_value(
     await hass.async_block_till_done()
 
     assert hass.states.get("sensor.alfen_real_energy_delivered_sum").state == "45745.98"
+
+
+async def test_an_energy_total_ignores_a_torn_read(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_connection: MockModbusConnection,
+) -> None:
+    """A counter served mid-update dips, and Home Assistant calls that a reset."""
+    mock_connection.for_unit(1).holding[374] = f64(45_700.0)  # 0.1% below
+
+    await setup_integration.runtime_data.async_refresh()
+    await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.alfen_real_energy_delivered_sum").state == "45745.98"
+
+    mock_connection.for_unit(1).holding[374] = f64(120.0)  # a replaced meter
+    await setup_integration.runtime_data.async_refresh()
+    await hass.async_block_till_done()
+
+    assert hass.states.get("sensor.alfen_real_energy_delivered_sum").state == "120.0"

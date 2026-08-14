@@ -17,6 +17,7 @@ from modbus_connection import (
     ModbusConnection,
     ModbusConnectionError,
     ModbusError,
+    ModbusTimeoutError,
     ModbusUnit,
 )
 from modbus_connection.model import Component, ComponentGroup
@@ -71,7 +72,9 @@ class _PolledUnit:
 
     _polled: dict[str, Component]
 
-    async def async_update(self, *, notify: bool = True) -> UpdateReport:
+    async def async_update(
+        self, *, notify: bool = True, answered: bool = False
+    ) -> UpdateReport:
         """Refresh this unit's components, one read at a time.
 
         A component whose read fails keeps its previous values by construction,
@@ -79,6 +82,12 @@ class _PolledUnit:
         fire only after every component was tried; ``notify=False`` hands that
         to the caller, which is what lets a whole-charger poll settle first. A
         dead link raises ``ModbusConnectionError`` rather than being reported.
+
+        So does a timeout with nothing answered yet: a station that has gone
+        silent would otherwise be walked block by block at a full timeout each.
+        ``answered=True`` says another unit of the same device already replied
+        — or refused, which proves it is there just as well — so this unit's
+        timeouts are contained instead.
         """
         updated: set[str] = set()
         failed: dict[str, ModbusError] = {}
@@ -87,6 +96,10 @@ class _PolledUnit:
                 await component.async_update(notify=False)
             except ModbusConnectionError:
                 raise
+            except ModbusTimeoutError as err:
+                if not answered and not updated and not failed:
+                    raise  # nothing answered at all: assume the rest do not
+                failed[name] = err
             except ModbusError as err:
                 failed[name] = err
             else:
@@ -310,15 +323,22 @@ class AlfenCharger:
         Every component is read on its own, so a block one unit refuses or is
         slow to answer costs only that component: it keeps its previous values
         and is named in the report with its error, while the rest still
-        refresh. Listeners fire once the whole charger has been polled. Only a
-        dead link raises ``ModbusConnectionError``.
+        refresh. Listeners fire once the whole charger has been polled.
+
+        A dead link raises ``ModbusConnectionError``, and a station that does
+        not answer its first block at all raises ``ModbusTimeoutError`` — one
+        timeout, rather than one per block of every unit. The test is per
+        charger, not per unit: the station is the probe, and once it has
+        answered a silent socket is contained like any other failure.
         """
         polls: list[tuple[str, _PolledUnit, UpdateReport]] = [
             ("station", self.station, await self.station.async_update(notify=False))
         ]
         station_time = self.station.time
         for socket in self:
-            report = await socket.async_update(notify=False)
+            # Reaching here means the station replied or refused, so the
+            # charger is there and a socket's timeout is only its own.
+            report = await socket.async_update(notify=False, answered=True)
             socket.update_session(station_time)
             polls.append((f"socket_{socket.number}", socket, report))
 

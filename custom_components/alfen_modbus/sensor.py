@@ -806,12 +806,25 @@ class AlfenTotalSensor(_AlfenSensor, RestoreSensor):
         super()._handle_coordinator_update()
 
     def _process_data(self) -> None:
-        """Take the reading, unless there is nothing to take.
+        """Take the reading, unless there is nothing worth taking.
 
         A reserved or absent register answers NaN, which decodes to None (spec
         §1.2) — through a *successful* poll, so staying available never covers
         it. Unknown gaps statistics just as badly as unavailable, so the total
         keeps what it had.
+
+        A counter served mid-update reads a hair below the last value, which
+        Home Assistant would take for a meter reset; that too keeps what it
+        had. Both are the same rule — hold the last good reading — so the
+        second only ever sees a value the first let through.
         """
-        if (value := self._reading()) is not None:
-            self._attr_native_value = value
+        if (value := self._reading()) is None:
+            return
+        last = self._attr_native_value
+        if (
+            self.entity_description.state_class is SensorStateClass.TOTAL_INCREASING
+            and last is not None
+            and last * 0.99 <= value < last
+        ):
+            return  # ignore firmware issue causing minor decrease
+        self._attr_native_value = value

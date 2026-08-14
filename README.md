@@ -46,11 +46,14 @@ A poll reads each block on its own, so one block the station refuses or is slow
 to answer does not take the rest of the poll with it: `async_update()` returns
 an `UpdateReport` naming the failed ones (`station.product`, `socket_1.meter`)
 with their errors, and only that block's own entities go unavailable while
-every other block refreshes. Only a dead link raises.
+every other block refreshes. A dead link raises, and so does a station that
+does not answer its first block at all: reading the rest would only pay a
+timeout each.
 
 Energy totals are the exception: they hold their last value and restore it
 across a restart, so a charger that is off the network overnight — or a meter
-answering NaN — does not gap its long-term statistics.
+answering NaN, or a counter read mid-update — does not gap its long-term
+statistics.
 
 ## Installation
 
